@@ -746,6 +746,14 @@
           parts.push("图片保存失败：" + res.imageDownload.error);
         else parts.push("页面未检测到图片");
       }
+      if (res && res.imageUpload) {
+        if (res.imageUpload.ok) parts.push("图片已上传到115");
+        else parts.push("图片上传失败：" + (res.imageUpload.error_msg || "未知错误"));
+      }
+      if (res && res.imageRename) {
+        if (res.imageRename.ok) parts.push("图片已重命名为：" + res.imageRename.name);
+        else parts.push("图片重命名失败：" + (res.imageRename.error_msg || ""));
+      }
       showToast(parts.join(" · "), res && res.ok ? "success" : "error");
     } catch (e) {
       showToast("转存失败：" + (e && e.message ? e.message : e), "error");

@@ -459,7 +459,9 @@ async function listFiles(cid) {
   return data.map((f) => {
     const fid = String(f.fid || "");
     const cid2 = String(f.cid || "");
-    const isDir = fid === "" || fid === "0";
+    // 用户规范：data 中对象有 uid 的是文件，没有 uid 的是目录
+    const hasUid = f.uid !== undefined && f.uid !== null && f.uid !== "";
+    const isDir = !hasUid;
     return { fid: isDir ? cid2 : fid, cid: cid2, n: f.n || "", s: Number(f.s) || 0, isDir };
   });
 }
@@ -525,6 +527,33 @@ async function renameFile(fid, name) {
   };
 }
 
+/**
+ * 移动文件到指定目录（用户规范）
+ * POST https://webapi.115.com/files/move
+ * 参数：pid=<目标目录cid>，fid[0]=<文件id> ...
+ */
+async function moveFiles(pid, fileIds) {
+  try {
+    const body = new URLSearchParams();
+    body.append("pid", String(pid));
+    (fileIds || []).forEach((fid, i) => body.append("fid[" + i + "]", String(fid)));
+    const json = await requestJson("https://webapi.115.com/files/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+      body: body.toString(),
+    });
+    const state = json && json.state;
+    const success = state === true || state === 1 || state === "1" || state === "true";
+    return {
+      ok: success,
+      error_msg: success ? "" : ((json && json.error_msg) || (json && json.error) || "未知错误"),
+      data: json,
+    };
+  } catch (e) {
+    return { ok: false, error_msg: e && e.message ? e.message : String(e) };
+  }
+}
+
 /** 清理文件名中的非法字符 */
 function sanitizeFileName(name) {
   return (
@@ -556,7 +585,7 @@ async function renameImageInDir(dirCid, originalName, pageTitle) {
     }
     base = sanitizeFileName(base);
     const r = await renameFile(uploaded.fid, base);
-    return r.ok ? { ok: true, name: base } : { ok: false, error_msg: r.error_msg };
+    return r.ok ? { ok: true, name: base, fid: uploaded.fid } : { ok: false, error_msg: r.error_msg };
   } catch (e) {
     return { ok: false, error_msg: e && e.message ? e.message : String(e) };
   }
@@ -607,12 +636,14 @@ function notifyTab(tabId, payload) {
 }
 
 /**
- * 转存成功后异步处理（用户规范）：
+ * 转存成功后异步处理（用户规范，效率优化版）：
+ * 图片已在转存时立即上传到「云下载」目录并重命名；这里只负责：
  * 1) 转存前已记录「云下载」目录现有条目（beforeItems）
- * 2) 轮询「云下载」目录（最多 30 秒），检测新增目录/文件 → 通过其 cid 进入对应目录
- * 3) 进入目录后：重命名最大文件为标题 → 上传图片到该目录 → 重命名图片为标题
+ * 2) 轮询「云下载」目录（最多 30 秒），检测新增【目录】（data 中有 uid 的是文件、
+ *    无 uid 的是目录；只看新增目录，避免提前上传的图片等文件误触发）
+ * 3) 进入目录后：重命名最大文件为标题 → 把图片从云下载目录移动到该目录（files/move）
  */
-async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle, magnetName, imageBytes, imageName }) {
+async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle, magnetName, imageFid, imageRenameName }) {
   const beforeKeys = new Set(beforeItems.map((it) => (it.isDir ? "D" : "F") + it.fid));
   const deadline = Date.now() + COMPLETE_TIMEOUT;
   let newItem = null;
@@ -622,11 +653,12 @@ async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle,
     try {
       const cid = yunDirCid || (await getYunDownloadCid());
       const items = await listFiles(cid);
-      const added = items.filter((it) => !beforeKeys.has((it.isDir ? "D" : "F") + it.fid));
-      if (added.length) {
-        newItem = added[0];
-        // 新增目录 → 进入该目录；新增文件（单文件种子）→ 目标就是云下载目录本身
-        targetDir = newItem.isDir ? newItem.fid : cid;
+      // 用户规范：只看新增【目录】（文件可能因提前上传/分页被误判，目录最可靠）。
+      // 转存时上传的图片是文件，不会触发；真正的磁力下载完成会创建新目录。
+      const addedDirs = items.filter((it) => it.isDir && !beforeKeys.has("D" + it.fid));
+      if (addedDirs.length) {
+        newItem = addedDirs[0];
+        targetDir = newItem.fid; // 进入该目录
         break;
       }
     } catch (e) {
@@ -636,41 +668,41 @@ async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle,
   }
 
   if (!newItem) {
-    await appendLog("error", "30秒内未在云下载目录发现新增条目，视为下载失败");
-    notifyTab(tabId, { type: "jobUpdate", ok: false, text: "115下载失败：30秒内未检测到新增文件/目录" });
+    await appendLog("error", "30秒内未在云下载目录发现新增目录，视为下载失败");
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: "115下载失败：30秒内未检测到新增目录" });
     return;
   }
 
-  await appendLog(
-    "ok",
-    "检测到新增" + (newItem.isDir ? "目录" : "文件") + "：「" + newItem.n + "」（cid=" + targetDir + "），进入该目录处理"
-  );
+  await appendLog("ok", "检测到新增目录：「" + newItem.n + "」（cid=" + targetDir + "），进入该目录处理");
   notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115下载完成，进入目录：「" + newItem.n + "」" });
 
   // 1) 重命名目录中最大的文件为标题
   await renameLargestFileInDir(targetDir, pageTitle, magnetName, tabId, "");
 
-  // 2) 上传图片到该目录 + 重命名图片为标题
-  if (imageBytes) {
-    notifyTab(tabId, { type: "jobUpdate", ok: true, text: "正在上传图片到115…" });
-    const up = await uploadImageTo115(targetDir, imageName || "image.jpg", imageBytes);
-    await appendLog(
-      up.ok ? "ok" : "error",
-      "图片上传到115：" + (up.ok ? "成功（" + up.name + "，目录 cid=" + targetDir + "）" : "失败：" + up.error_msg)
-    );
-    if (up.ok) {
-      const rn = await renameImageInDir(targetDir, imageName, pageTitle);
-      await appendLog(
-        rn.ok ? "ok" : "error",
-        "上传的图片重命名：" + (rn.ok ? "成功 → " + rn.name : "失败：" + rn.error_msg)
-      );
-      notifyTab(
-        tabId,
-        { type: "jobUpdate", ok: rn.ok, text: rn.ok ? "图片已上传并重命名为：" + rn.name : "图片重命名失败：" + rn.error_msg }
-      );
-    } else {
-      notifyTab(tabId, { type: "jobUpdate", ok: false, text: "图片上传失败：" + up.error_msg });
+  // 2) 把转存时上传到云下载目录的图片移动到对应目录（files/move）
+  if (imageFid || imageRenameName) {
+    let fid = imageFid;
+    // fid 缺失时按重命名后的文件名在云下载目录中找回
+    if (!fid && imageRenameName && yunDirCid) {
+      try {
+        const items = await listFiles(yunDirCid);
+        const f = items.find((it) => !it.isDir && it.n === imageRenameName);
+        if (f) fid = f.fid;
+      } catch (e) {
+        /* ignore */
+      }
     }
+    if (!fid) {
+      await appendLog("error", "未找到图片的 fid，跳过移动到对应目录");
+      notifyTab(tabId, { type: "jobUpdate", ok: false, text: "未找到图片，跳过移动到对应目录" });
+      return;
+    }
+    const mv = await moveFiles(targetDir, [fid]);
+    await appendLog(
+      mv.ok ? "ok" : "error",
+      "移动图片到目录 cid=" + targetDir + "：" + (mv.ok ? "成功" : "失败：" + mv.error_msg)
+    );
+    notifyTab(tabId, { type: "jobUpdate", ok: mv.ok, text: mv.ok ? "图片已移动到对应目录" : "图片移动失败：" + mv.error_msg });
   }
 }
 
@@ -721,7 +753,32 @@ async function handleTransferMagnet(msg, sender) {
     "图片处理结果：" + (imageRes.ok ? "已保存到本地（" + imageRes.size + " 字节）" : "失败：" + (imageRes.error || ""))
   );
 
-  // 2) 转存成功后：后台轮询云下载目录检测新增条目 → 重命名最大文件 → 上传图片到该目录
+  // 2) 立即上传图片到「云下载」目录并重命名为标题（效率优化：不等磁力下载完成）
+  if (!yunDirCid) {
+    try {
+      yunDirCid = await getYunDownloadCid();
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  let imageUpload = null;
+  let imageRename = null;
+  if (imageRes.ok && yunDirCid) {
+    imageUpload = await uploadImageTo115(yunDirCid, msg.imageName || "image.jpg", imageRes.bytes);
+    await appendLog(
+      imageUpload.ok ? "ok" : "error",
+      "图片上传到云下载目录：" + (imageUpload.ok ? "成功（" + imageUpload.name + "，cid=" + yunDirCid + "）" : "失败：" + imageUpload.error_msg)
+    );
+    if (imageUpload.ok) {
+      imageRename = await renameImageInDir(yunDirCid, msg.imageName, pageTitle);
+      await appendLog(
+        imageRename.ok ? "ok" : "error",
+        "图片重命名为标题：" + (imageRename.ok ? "成功 → " + imageRename.name : "失败：" + imageRename.error_msg)
+      );
+    }
+  }
+
+  // 3) 转存成功后：后台轮询磁力下载完成 → 重命名目录最大文件 → 把图片移动到对应目录
   if (res.ok) {
     notifyTab(tabId, { type: "jobUpdate", ok: true, text: "转存成功，正在等待115下载完成（30秒内）…" });
     watchNewDirAndProcess({
@@ -730,12 +787,12 @@ async function handleTransferMagnet(msg, sender) {
       beforeItems,
       pageTitle,
       magnetName,
-      imageBytes: imageRes.ok ? imageRes.bytes : "",
-      imageName: msg.imageName || "",
+      imageFid: imageRename && imageRename.ok ? imageRename.fid : "",
+      imageRenameName: imageRename && imageRename.ok ? imageRename.name : "",
     }); // 异步，不阻塞响应
   }
 
-  return { ...res, imageDownload: imageRes };
+  return { ...res, imageDownload: imageRes, imageUpload, imageRename };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
