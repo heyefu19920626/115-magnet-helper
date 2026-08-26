@@ -915,4 +915,20 @@
 
   // 页面加载后自动预热一次 115 Cookie（失败静默，不影响使用）
   sendMessage({ type: "get115Cookies" }).catch(() => {});
+
+  // 页面加载完成后自动查重：若 115 中已存在该影片，
+  // 把右上角「分析」按钮文字替换为「番号xxx已存在」（点击仍可正常分析）
+  (async () => {
+    try {
+      const title = getContentTitle();
+      if (!title) return;
+      const res = await sendMessage({ type: "searchExisting", title });
+      if (res && res.ok && res.exists) {
+        fab.textContent = "番号" + (res.searchValue || "") + "已存在";
+        fab.title = "点击仍可分析（" + title + "）";
+      }
+    } catch (e) {
+      /* 静默失败，不影响分析按钮 */
+    }
+  })();
 })();

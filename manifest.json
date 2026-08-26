@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "115 磁力分析助手",
-  "version": "1.1.0",
-  "description": "在任意网页分析磁力链接，自动获取 115.com 的 Cookie 一键转存；转存同时下载页面最大图片；下载完成后自动将目录中最大文件重命名为页面标题",
+  "version": "1.2.0",
+  "description": "javdb/javbus 磁力分析：自动查重（番号xxx已存在）、一键转存115、下载并上传封面、完成后重命名最大文件",
   "permissions": [
     "cookies",
     "downloads",
@@ -20,8 +20,10 @@
   "content_scripts": [
     {
       "matches": [
-        "http://*/*",
-        "https://*/*"
+        "https://javdb.com/*",
+        "https://*.javdb.com/*",
+        "https://javbus.com/*",
+        "https://*.javbus.com/*"
       ],
       "js": [
         "content.js"
