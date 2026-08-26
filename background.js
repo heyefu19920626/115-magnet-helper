@@ -706,6 +706,54 @@ async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle,
   }
 }
 
+/** 提取标题最前面的字母-数字（番号，如 "MIAB-481"） */
+function leadingCode(title) {
+  const m = String(title || "").trim().match(/^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*/);
+  return m ? m[0] : "";
+}
+
+/**
+ * 查询 115 中是否已存在同番号影片（用户规范）
+ * GET https://webapi.115.com/files/search?offset=0&limit=30&search_value=<番号>&...&format=json
+ * 遍历响应 data，判断对象的 n 是否以番号开头（不区分大小写）
+ * 返回 { ok, exists, searchValue, matches? }
+ */
+async function searchExistingMovies(title) {
+  const code = leadingCode(title);
+  if (!code) return { ok: true, exists: false, searchValue: "" };
+  const q = new URLSearchParams({
+    offset: "0",
+    limit: "30",
+    search_value: code,
+    date: "",
+    aid: "1",
+    cid: "0",
+    pick_code: "",
+    type: "",
+    count_folders: "1",
+    source: "",
+    format: "json",
+  });
+  try {
+    const json = await requestJson("https://webapi.115.com/files/search?" + q.toString());
+    const data = Array.isArray(json && json.data) ? json.data : [];
+    const codeLower = code.toLowerCase();
+    const matches = data.filter((it) => String(it.n || "").toLowerCase().startsWith(codeLower));
+    await appendLog(
+      "info",
+      "115查重：番号=" + code + "，搜索结果 " + data.length + " 条，匹配 " + matches.length + " 条"
+    );
+    return {
+      ok: true,
+      exists: matches.length > 0,
+      searchValue: code,
+      matches: matches.slice(0, 10).map((m) => ({ n: m.n, fid: m.fid })),
+    };
+  } catch (e) {
+    return { ok: false, error: e && e.message ? e.message : String(e) };
+  }
+}
+
 /* ================= 消息处理 ================= */
 
 async function handleTransferMagnet(msg, sender) {
@@ -809,6 +857,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleTransferMagnet(msg, sender)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, state: false, error_msg: String(e && e.message ? e.message : e) }));
+    return true;
+  }
+
+  if (msg.type === "searchExisting") {
+    searchExistingMovies(String(msg.title || ""))
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String(e && e.message ? e.message : e) }));
     return true;
   }
 

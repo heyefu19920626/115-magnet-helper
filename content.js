@@ -444,6 +444,12 @@
       border-bottom: 1px solid #f0f2f5;
       word-break: break-all;
     }
+    .m115-exists {
+      padding: 8px 16px;
+      font-size: 13px; font-weight: 600;
+      background: #fff1f0; color: #cf1322;
+      border-bottom: 1px solid #ffd4d2;
+    }
     .m115-toolbtn {
       flex: 0 0 auto;
       padding: 4px 10px;
@@ -549,9 +555,10 @@
     h("button", { class: "m115-close", text: "✕" })
   );
   const pageTitleEl = h("div", { class: "m115-pagetitle" });
+  const existsEl = h("div", { class: "m115-exists", style: "display:none" });
   const imageInfoEl = h("div", { class: "m115-imageinfo" });
   const body = h("div", { class: "m115-body" });
-  panel.append(header, pageTitleEl, imageInfoEl, body);
+  panel.append(header, pageTitleEl, existsEl, imageInfoEl, body);
 
   // 提示气泡
   const toast = h("div", { class: "m115-toast" });
@@ -840,6 +847,27 @@
     renderLog();
   });
 
+  /**
+   * 查重：用标题最前面的字母-数字（番号）查询 115，若已存在则在标题下方提示
+   */
+  async function checkMovieExists(title) {
+    existsEl.textContent = "";
+    existsEl.style.display = "none";
+    if (!title) return;
+    let res = null;
+    try {
+      res = await sendMessage({ type: "searchExisting", title });
+    } catch (e) {
+      res = null;
+    }
+    if (res && res.ok && res.exists) {
+      existsEl.style.display = "";
+      existsEl.textContent = "⚠️ 番号" + (res.searchValue || "") + "已存在";
+    } else if (res && !res.ok) {
+      sendMessage({ type: "logEvent", msg: "115查重失败：" + (res.error || "未知错误") }).catch(() => {});
+    }
+  }
+
   // 点击「分析」：获取标题 + 最大图片，分析磁力链接并弹框展示
   fab.addEventListener("click", async () => {
     const title = getContentTitle();
@@ -852,6 +880,7 @@
     render(items, title, imageUrl, imageName);
     openPanel();
     refreshCookieStatus();
+    checkMovieExists(title); // 查重：115 中是否已存在该影片
     // 上报分析日志
     const siteCands = getSiteSpecificTitleCandidates();
     sendMessage({
