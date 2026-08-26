@@ -9,8 +9,7 @@
     "storage",
     "unlimitedStorage",
     "alarms",
-    "webRequest",
-    "webRequestBlocking"
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "<all_urls>"

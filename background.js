@@ -8,8 +8,8 @@
  *     - 内容脚本在页面上下文获取字节（同源自动带 Referer/Cookie）
  *     - 后台用 data: URL + saveAs:false 以原始文件名保存到本地（下载时先不重命名；
  *       若浏览器开启“下载前询问保存位置”，保存框由该设置决定，扩展 API 无法绕过）
- *     - 通过 chrome.cookies 读取图片域名 Cookie，与页面 Referer 一起经 webRequest
- *       注入请求头，兜底获取被防盗链拦截的图片
+ *     - 通过 chrome.cookies 读取图片域名 Cookie，与页面 Referer 一起经
+ *       declarativeNetRequest 修改请求头，兜底获取被防盗链拦截的图片
  *  4. 转存前记录「云下载」目录现有条目；转存后轮询该目录（最多 30 秒），
  *     检测到新增目录/文件即视为下载完成，通过其 cid 进入对应目录
  *  5. 进入目录后：把其中最大的文件重命名为网页内容标题，并把图片上传到该目录
@@ -27,41 +27,66 @@ const LOG_MAX = 500;                // 日志最大条数（超出丢弃最旧�
 const COMPLETE_TIMEOUT = 30 * 1000; // 检测云下载目录新增条目的轮询超时：30 秒（超时视为下载失败）
 const POLL_INTERVAL = 2000;         // 轮询间隔：2 秒
 
-/* ================= 请求头注入（防盗链图片） =================
- * javbus / javdb 等站点的图片 CDN 会校验 Referer 请求头，部分还要求携带本站 Cookie
+/* ================= 请求头注入（declarativeNetRequest） =================
+ * javbus / javdb 等站点的图片 CDN 会校验 Referer 请求头，部分还要求本站 Cookie
  * （登录态 / 会话 / Cloudflare 等），无 Cookie 的请求直接返回 403。
- * 扩展 Service Worker 的 fetch 无法通过 referrer 选项携带来源（会被忽略），
- * 也无法直接设置 Cookie 头，因此用 chrome.webRequest 在请求发出前注入
- * Referer 与 Cookie 头（需要 webRequest / webRequestBlocking 权限与 <all_urls> 主机权限）。
- * pendingHeaders: { 图片URL -> { referer, cookie } }，只对即将发起的那一次请求生效，用完即删。
+ * 扩展 SW 的 fetch 无法通过 referrer 选项携带来源（会被忽略）、无法直接设置
+ * Cookie 头，且 chrome.webRequest 拦截不到扩展自身发起的请求（会导致注入无效、
+ * 请求仍 403），因此改用 declarativeNetRequest 的 modifyHeaders 规则——
+ * 它在网络层对包括扩展请求在内的所有请求生效（需要 declarativeNetRequest 权限
+ * 与 <all_urls> 主机权限）。图片请求前临时注册规则、请求后移除。
+ * 同时按 wget 的行为移除 Origin 头（浏览器跨域 fetch 会带
+ * Origin: chrome-extension://…，部分站点会因此拒绝）。
  */
-const pendingHeaders = new Map();
+let ruleIdCounter = 11500;
+const activeRuleIds = new Set();
 
-chrome.webRequest.onBeforeSendHeaders.addListener(
-  (details) => {
-    const hdrs = pendingHeaders.get(details.url);
-    if (hdrs) {
-      const headers = details.requestHeaders || [];
-      const set = (name, value) => {
-        let found = false;
-        for (const h of headers) {
-          if (h.name.toLowerCase() === name.toLowerCase()) {
-            h.value = value;
-            found = true;
-            break;
-          }
-        }
-        if (!found) headers.push({ name, value });
-      };
-      if (hdrs.referer) set("Referer", hdrs.referer);
-      if (hdrs.cookie) set("Cookie", hdrs.cookie);
-      return { requestHeaders: headers };
-    }
-    return { requestHeaders: details.requestHeaders };
-  },
-  { urls: ["http://*/*", "https://*/*"] },
-  ["blocking", "extraHeaders"]
-);
+function hostOf(url) {
+  try {
+    return new URL(String(url || "")).hostname;
+  } catch (e) {
+    return "";
+  }
+}
+
+/** 为指定图片请求注册 DNR 头修改：设置 Referer（与 Cookie），可选移除 Origin */
+async function dnrInjectHeaders(imageUrl, referer, cookieHeader, removeOrigin) {
+  const host = hostOf(imageUrl);
+  if (!host) return null;
+  const requestHeaders = [];
+  if (referer) requestHeaders.push({ header: "referer", operation: "set", value: String(referer) });
+  if (cookieHeader) requestHeaders.push({ header: "cookie", operation: "set", value: String(cookieHeader) });
+  if (removeOrigin) requestHeaders.push({ header: "origin", operation: "remove" });
+  if (!requestHeaders.length) return null;
+  const id = ++ruleIdCounter;
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      addRules: [
+        {
+          id,
+          priority: 1,
+          action: { type: "modifyHeaders", requestHeaders },
+          condition: { requestDomains: [host] },
+        },
+      ],
+    });
+    activeRuleIds.add(id);
+    return id;
+  } catch (e) {
+    console.error("[115磁力助手] DNR 注入失败：", e);
+    return null;
+  }
+}
+
+async function dnrRemoveHeaders(id) {
+  if (!id || !activeRuleIds.has(id)) return;
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [id] });
+  } catch (e) {
+    /* ignore */
+  }
+  activeRuleIds.delete(id);
+}
 
 /* ================= Cookie ================= */
 
@@ -113,15 +138,23 @@ function uidFromCookie(header) {
   return m ? m[1] : "";
 }
 
-/** 读取指定 URL（图片）对应域名的全部 Cookie，拼成 "name=value; ..." 请求头格式（含 HttpOnly） */
-async function getCookiesHeaderForUrl(url) {
-  try {
-    const cookies = await getAllCookies({ url: String(url || "") });
-    if (!cookies || !cookies.length) return "";
-    return cookies.map((c) => c.name + "=" + c.value).join("; ");
-  } catch (e) {
-    return "";
-  }
+/** 合并图片域名与页面域名的 Cookie（去重），拼成 "name=value; ..." 请求头格式（含 HttpOnly） */
+async function getCookiesHeaderForFetch(imageUrl, pageUrl) {
+  const seen = new Map();
+  const add = async (url) => {
+    if (!url) return;
+    try {
+      const cookies = await getAllCookies({ url: String(url) });
+      for (const c of cookies || []) {
+        if (!seen.has(c.name)) seen.set(c.name, c.value);
+      }
+    } catch (e) {
+      /* ignore */
+    }
+  };
+  await add(imageUrl);
+  await add(pageUrl);
+  return [...seen.entries()].map(([k, v]) => k + "=" + v).join("; ");
 }
 
 /* ================= 工作日志 ================= */
@@ -305,20 +338,29 @@ async function saveImageBytesLocally(filename, bytes) {
 
 /**
  * 后台兜底获取图片（内容脚本取不到字节时使用）：
- * 1) 读取图片对应域名的 Cookie，与页面 Referer 一起通过 webRequest 注入请求头
+ * 1) 合并图片域名与页面域名的 Cookie，与页面 Referer 一起通过 declarativeNetRequest
+ *    修改请求头（并移除 Origin），再 fetch
+ *    （按 origin 匹配，图片重定向后依然生效）
  * 2) 校验 Content-Type 确实是图片（避免把 HTML 错误页当图片保存）
  * 3) 交给 saveImageBytesLocally 静默保存，并返回字节（base64）供上传使用
  */
 async function prepareImageDownload(imageUrl, filename, referer) {
-  const cookieHeader = await getCookiesHeaderForUrl(imageUrl);
-  if (referer || cookieHeader) {
-    pendingHeaders.set(imageUrl, { referer: referer || "", cookie: cookieHeader });
-  }
+  const cookieHeader = await getCookiesHeaderForFetch(imageUrl, referer);
+  // DNR 注入：设置 Referer（页面地址）+ Cookie，并移除 Origin（与 wget 行为一致）
+  const ruleId = await dnrInjectHeaders(imageUrl, referer, cookieHeader, true);
+  await appendLog(
+    "info",
+    "后台兜底获取图片：url=" + imageUrl +
+      "，注入Referer=" + (referer || "无") +
+      "，注入Cookie条数=" + (cookieHeader ? cookieHeader.split("; ").length : 0) +
+      "，DNR规则=" + (ruleId ? "已注册" : "未注册")
+  );
   try {
     // 有显式 Cookie 头时用 credentials: "omit"，避免浏览器重复附加一份
     const resp = await fetch(imageUrl, {
       credentials: cookieHeader ? "omit" : "include",
     });
+    await appendLog(resp.ok ? "ok" : "error", "后台兜底图片响应：HTTP " + resp.status);
     if (!resp.ok) return { ok: false, error: "图片获取失败（HTTP " + resp.status + "）" };
     const ct = resp.headers.get("content-type") || "";
     if (ct && !/^image\//i.test(ct)) {
@@ -331,7 +373,7 @@ async function prepareImageDownload(imageUrl, filename, referer) {
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) };
   } finally {
-    pendingHeaders.delete(imageUrl);
+    await dnrRemoveHeaders(ruleId);
   }
 }
 
@@ -715,6 +757,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "getLog") {
     getLog().then((log) => sendResponse({ ok: true, log: log.slice().reverse() })); // 最新的在最上面
+    return true;
+  }
+
+  // 内容脚本在 fetch 图片前调用：注册 DNR 注入（Referer = 当前页面地址），
+  // 确保图片请求携带正确的来源（javbus 等要求 Referer 等于页面完整地址）
+  if (msg.type === "registerImageHeaders") {
+    dnrInjectHeaders(msg.url, msg.referer || "", "", false)
+      .then((ruleId) => sendResponse({ ok: !!ruleId, ruleId: ruleId || null }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (msg.type === "unregisterImageHeaders") {
+    dnrRemoveHeaders(msg.ruleId);
+    sendResponse({ ok: true });
     return true;
   }
 

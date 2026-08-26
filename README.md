@@ -76,8 +76,11 @@
   图片下载失败时可直接复制该地址到浏览器打开验证（如 404 / 防盗链 / 需登录等）。
 - 弹框右上角 **「日志」** 按钮打开工作日志视图（再点「返回」回到列表，可「清空」）：
   - 记录内容脚本事件：分析完成（标题/图片/文件名/磁力数量）、点击转存、后台通知；
-  - 记录后台事件：收到转存请求、转存结果、图片校验/下载结果、云下载目录 cid、
-    每轮完成检测、最大文件、重命名结果、图片上传结果、超时等；
+  - **图片下载会记录实际使用的 URL 与 Referer**（如 "图片下载成功：url=…，Referer=https://www.javbus.com/xxx（HTTP 200，N 字节）"、
+    "图片下载失败：…（HTTP 403）"），后台兜底也会记录注入的 Referer 与 Cookie 条数——
+    便于核对防盗链（javbus 要求 Referer 等于页面完整地址）是否生效；
+  - 记录后台事件：收到转存请求、转存结果、图片校验/下载结果、新增目录检测、重命名结果、
+    图片上传结果、超时等；
   - 日志带时间戳与级别（信息蓝 / 成功绿 / 错误红），持久化在 `chrome.storage.local`（最多 500 条）。
 
 ## 实现要点
@@ -97,13 +100,16 @@
   仅传 `files_new_name[<最大文件fid>]` = 网页内容标题（标题中的非法文件名
   字符 `\ / : * ? " < > |` 等会被清理）。
 - **图片下载**：站点专属选择器优先（javdb `div.video-meta-panel`、javbus `a.bigImage` + 域名拼接）；
-  先由内容脚本在页面上下文 `fetch` 获取字节（同源请求浏览器自动带页面 Referer/Cookie）；
-  跨域 CDN 或页面内被 CORS/CSP 拦截时，转后台兜底——后台先用 `chrome.cookies` 读取
-  **该图片域名的 Cookie**（含 HttpOnly，javdb/javbus 图片 CDN 校验 Referer 且部分要求本站
-  Cookie，无 Cookie 会 403），再通过 **`chrome.webRequest` `onBeforeSendHeaders`
-  （`blocking` + `extraHeaders`）把页面 Referer 与 Cookie 一起注入请求头**后 fetch；
-  扩展 SW 的 fetch 无法用 `referrer` 选项携带来源、也无法直接设置 Cookie 头，因此 manifest
-  需要 `webRequest` / `webRequestBlocking` 权限与 `<all_urls>` 主机权限；
+  内容脚本在页面上下文 `fetch` 获取字节时，**显式指定 `referrer` = 当前页面地址 +
+  `referrerPolicy: "unsafe-url"`** 强制发送完整 Referer（用户规范：`Referer: cur_url`）——
+  javbus 等站点可能设置了 `no-referrer` 引用策略，浏览器会把同源请求的 Referer 也剥掉导致 403，
+  必须强制覆盖；同时携带本站 Cookie（`credentials: "include"`）；
+  跨域 CDN 或页面内被 CORS/CSP 拦截时，转后台兜底——后台合并**图片域名与页面域名**的
+  Cookie（含 HttpOnly），再通过 **`chrome.declarativeNetRequest` `modifyHeaders` 规则**
+  把页面 Referer 与 Cookie 写入请求头、并**移除 Origin 头**（与 wget 行为一致）后 fetch；
+  DNR 在网络层对包括扩展自身请求在内的所有请求生效（`chrome.webRequest` 拦截不到扩展
+  自身发起的请求，会导致注入无效、仍 403），因此 manifest 需要 `declarativeNetRequest`
+  权限与 `<all_urls>` 主机权限；
   拿到字节后以 data: URL + `saveAs: false` 静默保存到默认下载目录（原始文件名，不弹保存框）。
 - **图片上传**：下载图片后立即执行，`sampleinitupload.php`（filename/filesize/target=U_1_<云下载目录cid>）→
   用响应中的 OSS 字段（host/object/policy/OSSAccessKeyId/success_action_status/callback/signature）

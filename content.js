@@ -660,27 +660,65 @@
     showToast("正在转存，请稍候…", "info");
     sendMessage({ type: "logEvent", msg: "点击转存：" + item.url + "（名称：" + item.name + "）" }).catch(() => {});
 
-    // 页面上下文获取图片字节（同源请求浏览器自动携带页面 Referer + Cookie，可绕过 403）
+    // 页面上下文获取图片字节：
+    // 1) 先让后台注册 webRequest 注入：强制给该图片请求加上 Referer = 当前页面地址
+    //    （用户规范：Referer: cur_url）。内容脚本 fetch 可能不携带页面来源，
+    //    或页面引用策略会剥掉 Referer，webRequest 注入最可靠
+    // 2) fetch 并记录实际使用的 URL / Referer / 结果到日志，便于核对
     let imageBytes = null;
     if (lastAnalysis.imageUrl) {
+      const imageUrl = lastAnalysis.imageUrl;
+      const referer = location.href; // 当前页面地址 = Referer
+      // 注册 DNR 注入（返回规则 id，取完后注销）
+      let imgRuleId = null;
       try {
-        const r = await fetch(lastAnalysis.imageUrl, { credentials: "include" });
+        const reg = await sendMessage({
+          type: "registerImageHeaders",
+          url: imageUrl,
+          referer: referer,
+          timeout: 30000,
+        }).catch(() => null);
+        imgRuleId = reg && reg.ruleId ? reg.ruleId : null;
+      } catch (e) {
+        /* 注入注册失败不阻塞 */
+      }
+      try {
+        const r = await fetch(imageUrl, {
+          credentials: "include",
+          referrer: referer,
+          referrerPolicy: "unsafe-url",
+        });
         if (r.ok) {
           const ct = r.headers.get("content-type") || "";
           if (!ct || /^image\//i.test(ct)) {
             imageBytes = await r.arrayBuffer();
+            sendMessage({
+              type: "logEvent",
+              msg: "图片下载成功：url=" + imageUrl + "，Referer=" + referer + "（HTTP 200，" + imageBytes.byteLength + " 字节）",
+            }).catch(() => {});
           } else {
             sendMessage({ type: "logEvent", msg: "页面内图片不是图片类型：" + ct }).catch(() => {});
           }
         } else {
-          sendMessage({ type: "logEvent", msg: "页面内获取图片失败（HTTP " + r.status + "），转后台兜底" }).catch(() => {});
+          sendMessage({
+            type: "logEvent",
+            msg: "图片下载失败：url=" + imageUrl + "，Referer=" + referer + "（HTTP " + r.status + "），转后台兜底",
+          }).catch(() => {});
         }
       } catch (e) {
-        // 跨域图片会被 CORS 拦截，转后台用 webRequest 注入 Referer 兜底
+        // 跨域图片会被 CORS 拦截，转后台用 webRequest 注入 Referer/Cookie 兜底
         sendMessage({
           type: "logEvent",
-          msg: "页面内获取图片被拦截（可能跨域 CORS）：" + (e && e.message ? e.message : e) + "，转后台兜底",
+          msg: "页面内获取图片被拦截（可能跨域 CORS）：" + (e && e.message ? e.message : e) + "，url=" + imageUrl + "，Referer=" + referer + "，转后台兜底",
         }).catch(() => {});
+      }
+      // 取完即注销注入规则
+      if (imgRuleId) {
+        try {
+          await sendMessage({ type: "unregisterImageHeaders", ruleId: imgRuleId }).catch(() => {});
+        } catch (e) {
+          /* ignore */
+        }
       }
     }
 
