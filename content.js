@@ -390,6 +390,17 @@
     }
     .m115-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 6px 20px rgba(9,88,217,.55); }
     .m115-fab:active { transform: translateY(0) scale(.97); }
+    /* 查重状态：已存在（红） / 未保存（蓝） */
+    .m115-fab.exists {
+      background: linear-gradient(135deg, #ff4d4f, #cf1322);
+      box-shadow: 0 4px 16px rgba(207, 19, 34, .45);
+    }
+    .m115-fab.exists:hover { box-shadow: 0 6px 20px rgba(207, 19, 34, .55); }
+    .m115-fab.missing {
+      background: linear-gradient(135deg, #40a9ff, #1677ff);
+      box-shadow: 0 4px 16px rgba(22, 119, 255, .45);
+    }
+    .m115-fab.missing:hover { box-shadow: 0 6px 20px rgba(22, 119, 255, .55); }
 
     .m115-mask {
       position: fixed; inset: 0; z-index: 2147483646;
@@ -448,9 +459,10 @@
     .m115-exists {
       padding: 8px 16px;
       font-size: 13px; font-weight: 600;
-      background: #fff1f0; color: #cf1322;
-      border-bottom: 1px solid #ffd4d2;
+      border-bottom: 1px solid;
     }
+    .m115-exists.exists { background: #fff1f0; color: #cf1322; border-bottom-color: #ffd4d2; }
+    .m115-exists.missing { background: #e6f4ff; color: #1677ff; border-bottom-color: #bae0ff; }
     .m115-toolbtn {
       flex: 0 0 auto;
       padding: 4px 10px;
@@ -849,7 +861,8 @@
   });
 
   /**
-   * 查重：用标题最前面的字母-数字（番号）查询 115，若已存在则在标题下方提示
+   * 查重：用标题最前面的字母-数字（番号）查询 115，
+   * 已存在 → 红色「番号xxx已存在」；未保存 → 蓝色「番号xxx未保存」
    */
   async function checkMovieExists(title) {
     existsEl.textContent = "";
@@ -861,9 +874,16 @@
     } catch (e) {
       res = null;
     }
-    if (res && res.ok && res.exists) {
+    if (res && res.ok) {
+      const code = res.searchValue || "";
       existsEl.style.display = "";
-      existsEl.textContent = "⚠️ 番号" + (res.searchValue || "") + "已存在";
+      if (res.exists) {
+        existsEl.className = "m115-exists exists";
+        existsEl.textContent = "⚠️ 番号" + code + "已存在";
+      } else {
+        existsEl.className = "m115-exists missing";
+        existsEl.textContent = "番号" + code + "未保存";
+      }
     } else if (res && !res.ok) {
       sendMessage({ type: "logEvent", msg: "115查重失败：" + (res.error || "未知错误") }).catch(() => {});
     }
@@ -917,16 +937,24 @@
   // 页面加载后自动预热一次 115 Cookie（失败静默，不影响使用）
   sendMessage({ type: "get115Cookies" }).catch(() => {});
 
-  // 页面加载完成后自动查重：若 115 中已存在该影片，
-  // 把右上角「分析」按钮文字替换为「番号xxx已存在」（点击仍可正常分析）
+  // 页面加载完成后立刻分析并查重（用户规范）：
+  // 已存在 → 红底「番号xxx已存在」；未保存 → 蓝底「番号xxx未保存」；
+  // 未出结果前保持「分析」（点击仍可正常分析）
   (async () => {
     try {
       const title = getContentTitle();
       if (!title) return;
       const res = await sendMessage({ type: "searchExisting", title });
-      if (res && res.ok && res.exists) {
-        fab.textContent = "番号" + (res.searchValue || "") + "已存在";
+      if (res && res.ok) {
+        const code = res.searchValue || "";
         fab.title = "点击仍可分析（" + title + "）";
+        if (res.exists) {
+          fab.textContent = "番号" + code + "已存在";
+          fab.className = "m115-fab exists";
+        } else {
+          fab.textContent = "番号" + code + "未保存";
+          fab.className = "m115-fab missing";
+        }
       }
     } catch (e) {
       /* 静默失败，不影响分析按钮 */
