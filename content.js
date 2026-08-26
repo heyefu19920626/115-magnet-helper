@@ -1,14 +1,15 @@
 /**
  * 115 磁力分析助手 - 内容脚本
  *
- * 在任意网页注入右上角「分析」按钮：
+ * 在 javdb / javbus 页面注入右上角「分析」按钮：
  *  1. 点击后分析页面内所有磁力链接（提取名称 + 大小，按大小从大到小排序）
  *  2. 同时从网页内容中获取「以字母/数字开头的完整标题」（磁力链接文字 / dn /
  *     title 类元素 / 标题元素等，不使用 document.title），显示在弹框最上面
  *  3. 弹框按行展示，每条带「转存」按钮；无磁力链接时提示「无资源」
- *  4. 点击「转存」→ 后台使用 115 Cookie 调用 add_task_url；同时把页面最大图片
- *     下载到本地；转存成功后后台等待 115 下载完成，自动进入“云下载”目录把最大
- *     文件重命名为网页内容标题，进度通过 jobUpdate 消息气泡提示
+ *  4. 点击「转存」→ 后台使用 115 Cookie 调用 add_task_url；同时把页面图片字节
+ *     交给后台上传到 115；转存成功后后台轮询下载完成，进入“云下载”目录把最大
+ *     文件重命名为网页内容标题，并把图片移动到对应目录，进度通过 jobUpdate 气泡提示
+ *  5. 页面加载完成后自动查重：若 115 已存在，按钮文字替换为「番号xxx已存在」
  *
  * 所有 UI 都放在 Shadow DOM 中，避免被页面样式干扰。
  */
@@ -657,8 +658,8 @@
 
   /**
    * 转存：通知后台添加离线任务；
-   * 图片处理：页面上下文获取字节（同源自动携带页面 Referer，绕过防盗链）→ 交给后台
-   * 静默保存到本地（原始文件名，不重命名）→ 自动上传到 115 下载目录 → 上传后重命名。
+   * 图片处理：页面上下文获取字节（显式 Referer = 当前页面地址，绕过防盗链）→
+   * 交给后台上传到 115（不保存到本地）。
    */
   async function doTransfer(item, btn) {
     if (btn.disabled) return;
@@ -748,9 +749,9 @@
         parts.push("转存失败：" + ((res && res.error_msg) || "未知错误"));
       }
       if (res && res.imageDownload) {
-        if (res.imageDownload.ok) parts.push("图片已静默保存（" + (lastAnalysis.imageName || "") + "）");
+        if (res.imageDownload.ok) parts.push("图片已获取（" + (lastAnalysis.imageName || "") + "）");
         else if (res.imageDownload.error && res.imageDownload.error !== "页面未检测到图片")
-          parts.push("图片保存失败：" + res.imageDownload.error);
+          parts.push("图片获取失败：" + res.imageDownload.error);
         else parts.push("页面未检测到图片");
       }
       if (res && res.imageUpload) {

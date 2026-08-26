@@ -287,49 +287,13 @@ async function addTaskUrl(magnetUrl) {
 /* ================= 图片：保存到本地 + 上传到 115 ================= */
 
 /**
- * 下载到本地（data: URL，静默保存到默认下载目录）
- * 注意：chrome.downloads 的 headers 选项不允许 Referer 等不安全请求头；
- * saveAs: false 为尽力静默——若浏览器开启了“下载前询问每个文件的保存位置”，
- * 该设置会覆盖 saveAs（Chromium 已知问题），此时需在 chrome://settings/downloads 关闭。
- */
-function downloadImage(url, filename) {
-  return new Promise((resolve) => {
-    const options = { url, conflictAction: "uniquify", saveAs: false };
-    if (filename) options.filename = filename;
-    try {
-      chrome.downloads.download(options, (id) => {
-        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-        else resolve({ ok: true, id });
-      });
-    } catch (e) {
-      resolve({ ok: false, error: e && e.message ? e.message : String(e) });
-    }
-  });
-}
-
-/** 按文件名扩展名推断 MIME（用于构造 data: URL） */
-function mimeFromName(name) {
-  const m = String(name || "").match(/\.([^.\\/]+)$/);
-  const ext = m ? m[1].toLowerCase() : "";
-  const map = {
-    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif",
-    webp: "image/webp", bmp: "image/bmp", svg: "image/svg+xml",
-    heic: "image/heic", dng: "image/dng", avif: "image/avif",
-  };
-  return map[ext] || "image/jpeg";
-}
-
-/**
- * 把图片字节以 data: URL 形式静默保存到本地下载目录
+ * 校验并编码图片字节（不再保存到本地，仅用于上传 115）
  * 返回 { ok, bytes: base64, size }
  */
-async function saveImageBytesLocally(filename, bytes) {
+async function prepareImageBytes(filename, bytes) {
   try {
-    const safeName = sanitizeFileName(filename || "image.jpg");
+    if (!bytes || !bytes.length) return { ok: false, error: "图片内容为空" };
     const b64 = bytesToBase64(bytes);
-    const dataUrl = "data:" + mimeFromName(safeName) + ";base64," + b64;
-    const dl = await downloadImage(dataUrl, safeName);
-    if (!dl.ok) return { ok: false, error: "本地保存失败：" + dl.error };
     return { ok: true, bytes: b64, size: bytes.length };
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) };
@@ -341,8 +305,8 @@ async function saveImageBytesLocally(filename, bytes) {
  * 1) 合并图片域名与页面域名的 Cookie，与页面 Referer 一起通过 declarativeNetRequest
  *    修改请求头（并移除 Origin），再 fetch
  *    （按 origin 匹配，图片重定向后依然生效）
- * 2) 校验 Content-Type 确实是图片（避免把 HTML 错误页当图片保存）
- * 3) 交给 saveImageBytesLocally 静默保存，并返回字节（base64）供上传使用
+ * 2) 校验 Content-Type 确实是图片（避免把 HTML 错误页当图片）
+ * 3) 交给 prepareImageBytes 编码字节（base64）供上传使用
  */
 async function prepareImageDownload(imageUrl, filename, referer) {
   const cookieHeader = await getCookiesHeaderForFetch(imageUrl, referer);
@@ -369,7 +333,7 @@ async function prepareImageDownload(imageUrl, filename, referer) {
     const blob = await resp.blob();
     const bytes = new Uint8Array(await blob.arrayBuffer());
     if (!bytes.length) return { ok: false, error: "图片内容为空" };
-    return await saveImageBytesLocally(filename, bytes);
+    return await prepareImageBytes(filename, bytes);
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) };
   } finally {
@@ -785,11 +749,11 @@ async function handleTransferMagnet(msg, sender) {
     await appendLog("info", "转存前获取云下载目录失败，稍后重试：" + (e && e.message ? e.message : e));
   }
 
-  // 1) 添加任务 + 图片处理（静默保存到本地）同时进行
+  // 1) 添加任务 + 图片处理（获取字节，不保存本地）同时进行
   const [res, imageRes] = await Promise.all([
     addTaskUrl(magnetUrl),
     (async () => {
-      if (haveBytes) return await saveImageBytesLocally(msg.imageName, new Uint8Array(msg.imageBytes));
+      if (haveBytes) return await prepareImageBytes(msg.imageName, new Uint8Array(msg.imageBytes));
       if (msg.imageUrl) return await prepareImageDownload(msg.imageUrl, msg.imageName || "", msg.referer || "");
       return { ok: false, error: "页面未检测到图片" };
     })(),
@@ -798,7 +762,7 @@ async function handleTransferMagnet(msg, sender) {
   await appendLog(res.ok ? "ok" : "error", "转存结果：" + (res.ok ? "成功" : "失败：" + (res.error_msg || "")));
   await appendLog(
     imageRes.ok ? "ok" : "error",
-    "图片处理结果：" + (imageRes.ok ? "已保存到本地（" + imageRes.size + " 字节）" : "失败：" + (imageRes.error || ""))
+    "图片处理结果：" + (imageRes.ok ? "已获取字节（" + imageRes.size + " 字节）" : "失败：" + (imageRes.error || ""))
   );
 
   // 2) 立即上传图片到「云下载」目录并重命名为标题（效率优化：不等磁力下载完成）

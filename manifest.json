@@ -5,7 +5,6 @@
   "description": "javdb/javbus 磁力分析：自动查重（番号xxx已存在）、一键转存115、下载并上传封面、完成后重命名最大文件",
   "permissions": [
     "cookies",
-    "downloads",
     "storage",
     "unlimitedStorage",
     "alarms",

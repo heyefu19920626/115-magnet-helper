@@ -22,17 +22,10 @@
    - 使用 115 Cookie 以 POST 调用 `https://115.com/web/lixian/?ct=lixian&ac=add_task_url` 添加离线任务，
      根据响应中的 `state` / `error_msg` 判断并提示结果；
    - **同时**处理页面图片：站点专属优先（javdb.com 取 `div.video-meta-panel` 内的图片地址；
-     javbus.com 取 `a.bigImage` 内的图片地址，相对路径拼接在 `https://www.javbus.com` 之后；
-     其它站点取渲染尺寸最大的图片）——由**页面上下文**获取字节（同源请求浏览器自动携带
-     页面 Referer 与 Cookie，可绕过 javbus 等防盗链 403），后台用 data: URL +
-     `saveAs: false` 以**原始文件名**静默保存到默认下载目录（不弹保存框、先不重命名）；
-   - **下载图片后立即自动上传**到**该磁力链接对应的目录**（通过 `task_lists` 找到刚添加任务的
-     `wp_path_id` 保存目录，找不到时才回退「云下载」目录）：
-     `POST https://uplb.115.com/3.0/sampleinitupload.php`，
-     参数 `filename=<原始文件名>`、`filesize=<字节数>`、`target=U_1_<任务保存目录cid>`，
-     响应返回 OSS 上传字段（host/object/policy/accessid/signature/callback），
-     再把图片字节 multipart POST 到返回的 `host` 完成上传；
-   - **上传后再重命名**：按原始文件名在目录中找到刚上传的图片，重命名为网页内容标题
+     javbus.com 取 `a.bigImage` 内的图片地址，相对路径拼接在 `https://www.javbus.com` 之后）——
+     由**页面上下文**获取字节（显式 `Referer` = 当前页面地址，绕过防盗链 403），
+     只用于上传 115，**不保存到本地**（无下载弹框）；
+   - **上传后立即重命名**：按原始文件名在目录中找到刚上传的图片，重命名为网页内容标题
      （115 自动保留扩展名）；
 4. **完成检测与处理**（后台异步，用户规范，效率优化版）：
    - **转存后立即**把图片上传到「云下载」目录并重命名为网页内容标题（**不等磁力下载完成**）；
@@ -51,9 +44,9 @@
 
 ```
 115-magnet-helper/
-├── manifest.json     # Manifest V3 配置（cookies / downloads / storage / alarms）
-├── background.js     # 后台 Service Worker：Cookie、转存、图片下载/上传、完成检测 + 重命名
-├── content.js        # 内容脚本：分析按钮、弹框、内容标题/图片/磁力分析、转存交互
+├── manifest.json     # Manifest V3 配置（cookies / storage / alarms / declarativeNetRequest）
+├── background.js     # 后台 Service Worker：Cookie、转存、图片上传、完成检测 + 重命名 + 移动
+├── content.js        # 内容脚本：分析按钮、弹框、内容标题/图片/磁力分析、查重、转存交互
 └── popup.html        # 点击工具栏图标时的说明弹窗
 ```
 
@@ -109,7 +102,7 @@
 - **重命名**（用户规范）：`POST https://webapi.115.com/files/batch_rename`，
   仅传 `files_new_name[<最大文件fid>]` = 网页内容标题（标题中的非法文件名
   字符 `\ / : * ? " < > |` 等会被清理）。
-- **图片下载**：站点专属选择器优先（javdb `div.video-meta-panel`、javbus `a.bigImage` + 域名拼接）；
+- **图片获取**：站点专属选择器优先（javdb `div.video-meta-panel`、javbus `a.bigImage` + 域名拼接）；
   内容脚本在页面上下文 `fetch` 获取字节时，**显式指定 `referrer` = 当前页面地址 +
   `referrerPolicy: "unsafe-url"`** 强制发送完整 Referer（用户规范：`Referer: cur_url`）——
   javbus 等站点可能设置了 `no-referrer` 引用策略，浏览器会把同源请求的 Referer 也剥掉导致 403，
@@ -120,8 +113,8 @@
   DNR 在网络层对包括扩展自身请求在内的所有请求生效（`chrome.webRequest` 拦截不到扩展
   自身发起的请求，会导致注入无效、仍 403），因此 manifest 需要 `declarativeNetRequest`
   权限与 `<all_urls>` 主机权限；
-  拿到字节后以 data: URL + `saveAs: false` 静默保存到默认下载目录（原始文件名，不弹保存框）。
-- **图片上传**：下载图片后立即执行，`sampleinitupload.php`（filename/filesize/target=U_1_<云下载目录cid>）→
+  图片字节**只用于上传 115，不保存到本地**（无下载弹框）。
+- **图片上传**：获取字节后立即执行，`sampleinitupload.php`（filename/filesize/target=U_1_<云下载目录cid>）→
   用响应中的 OSS 字段（host/object/policy/OSSAccessKeyId/success_action_status/callback/signature）
   把图片字节 multipart 上传到 `host`；上传成功后把该图片重命名为网页内容标题。
 - **后台保活**：等待可能持续数小时，Service Worker 会被浏览器回收；
@@ -133,17 +126,12 @@
 
 ## 注意事项
 
-- 需要保持扩展权限包含 `cookies`、`downloads`、`storage`、`alarms`、`webRequest`、
-  `webRequestBlocking` 与 `<all_urls>` 主机权限（manifest 已配置）。
-- **保存图片弹框问题**：如果浏览器开启了「下载前询问每个文件的保存位置」
-  （chrome://settings/downloads），任何下载方式都会弹保存框——这是浏览器设置，
-  **扩展 API 无法覆盖**（Chromium 已知问题：`saveAs` 选项不生效），请在
-  `chrome://settings/downloads` 关闭「下载前询问每个文件的保存位置」即可静默下载。
-- 图片下载/上传失败时，日志会记录具体原因（HTTP 状态、Content-Type、本地保存错误等）；
+- 需要保持扩展权限包含 `cookies`、`storage`、`alarms`、`declarativeNetRequest`
+  与 `<all_urls>` 主机权限（manifest 已配置）。
+- 图片**不再下载到本地**（用户选择），只上传到 115——因此不会有任何下载保存框弹出。
+- 图片获取/上传失败时，日志会记录具体原因（HTTP 状态、Content-Type 等）；
   打开弹框右上角「日志」即可定位。防盗链图片需要先在该浏览器登录对应网站
   （扩展会读取该网站 Cookie 并随请求注入）。
-- 完成检测依赖「云下载」目录中文件名与磁力名称一致；若 115 对文件名做了改写导致无法匹配，
-  任务会在 24 小时后超时（可在 `background.js` 中调整 `JOB_TIMEOUT` 或匹配规则）。
 - 若 115 接口行为变化导致重命名/上传失败，可对照 115 网页端 DevTools 中真实网络请求调整
   `background.js` 顶部的接口地址。
 - 请仅用于个人学习与合法资源转存，遵守相关法律法规。
