@@ -54,8 +54,14 @@
     return Math.round(n * mult);
   }
 
-  /** 提取磁力链接对应的大小（优先 xl 参数，其次链接附近文本） */
-  function extractSize(href, a) {
+  /** 提取下载链接对应的大小（magnet：xl 参数 / 附近文本；ed2k：链接中的大小字段） */
+  function extractSize(href, a, type) {
+    if (type === "ed2k") {
+      // ed2k://|file|名称|大小|哈希|/
+      const m = href.match(/^ed2k:\/\/\|file\|[^|]*\|(\d+)\|/i);
+      if (m) return formatBytes(parseInt(m[1], 10));
+      return "未知大小";
+    }
     const xl = getParam(href, "xl");
     if (xl && /^\d+$/.test(xl)) return formatBytes(parseInt(xl, 10));
     if (a.title) {
@@ -70,8 +76,20 @@
     return "未知大小";
   }
 
-  /** 提取磁力链接名称（优先 dn 参数，其次链接文本） */
-  function extractName(href, a) {
+  /** 提取下载链接名称（magnet：dn 参数 / 链接文本；ed2k：链接中的文件名） */
+  function extractName(href, a, type) {
+    if (type === "ed2k") {
+      const m = href.match(/^ed2k:\/\/\|file\|([^|]+)\|/i);
+      if (m && m[1]) {
+        try {
+          return decodeURIComponent(m[1]);
+        } catch (e) {
+          return m[1];
+        }
+      }
+      const text = (a.textContent || "").trim().replace(/\s+/g, " ");
+      return text || "未知名称";
+    }
     const dn = getParam(href, "dn");
     if (dn) return dn;
     const text = (a.textContent || "").trim().replace(/\s+/g, " ");
@@ -79,8 +97,10 @@
     return "未知名称";
   }
 
-  /** 去重 key：优先按 BTIH 哈希，其次按完整链接 */
+  /** 去重 key：优先按 BTIH/ed2k 哈希，其次按完整链接 */
   function keyOf(href) {
+    const m2 = href.match(/^ed2k:\/\/\|file\|[^|]*\|\d*\|([0-9a-fA-F]+)\|/);
+    if (m2) return "ed2k:" + m2[1].toLowerCase();
     const xt = getParam(href, "xt") || "";
     const m = xt.match(/urn:btih:([a-zA-Z0-9]+)/i);
     if (m) return "btih:" + m[1].toLowerCase();
@@ -244,9 +264,15 @@
     );
   }
 
-  /** 分析页面中所有磁力链接，并按大小从大到小排序（未知大小排最后） */
+  /** 支持的下载链接前缀：magnet 磁力、ed2k 电驴 */
+  const LINK_PREFIXES = ["magnet:", "ed2k:"];
+
+  /** 分析页面中所有下载链接（magnet/ed2k），按大小从大到小排序（未知大小排最后） */
   function analyzePage() {
-    const anchors = Array.from(document.querySelectorAll('a[href^="magnet:" i]'));
+    const anchors = [];
+    for (const p of LINK_PREFIXES) {
+      anchors.push(...document.querySelectorAll('a[href^="' + p + '" i]'));
+    }
     const seen = new Set();
     const items = [];
     for (const a of anchors) {
@@ -255,11 +281,12 @@
       const key = keyOf(href);
       if (seen.has(key)) continue;
       seen.add(key);
-      const sizeText = extractSize(href, a);
-      const xl = getParam(href, "xl");
+      const type = /^magnet:/i.test(href) ? "magnet" : /^ed2k:/i.test(href) ? "ed2k" : "";
+      const sizeText = extractSize(href, a, type);
+      const xl = type === "magnet" ? getParam(href, "xl") : null;
       items.push({
         url: href,
-        name: extractName(href, a),
+        name: extractName(href, a, type),
         size: sizeText,
         bytes: xl && /^\d+$/.test(xl) ? parseInt(xl, 10) : parseSizeBytes(sizeText),
       });

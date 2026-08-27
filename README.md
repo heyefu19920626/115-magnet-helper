@@ -18,8 +18,9 @@
      `https://webapi.115.com/files/search?offset=0&limit=30&search_value=<番号>&date=&aid=1&cid=0&pick_code=&type=&count_folders=1&source=&format=json`
      查询 115；遍历响应 `data`，若存在 `n` 以该番号开头（不区分大小写）的对象，
      则标题下方显示**红色「⚠️ 番号xxx已存在」**，否则显示**蓝色「番号xxx未保存」**；
-   - 弹框按行展示页面所有磁力链接（名称 + 大小），**按大小从大到小排序**，每条带「转存」按钮；
-   - 无磁力链接时弹框提示 **无资源**；
+   - 弹框按行展示页面所有下载链接（**magnet 磁力 + ed2k 电驴**，名称 + 大小），
+     **按大小从大到小排序**，每条带「转存」按钮；
+   - 无下载链接时弹框提示 **无资源**；
 3. **转存**：点击「转存」后：
    - 使用 115 Cookie 以 POST 调用 `https://115.com/web/lixian/?ct=lixian&ac=add_task_url` 添加离线任务，
      根据响应中的 `state` / `error_msg` 判断并提示结果；
@@ -29,25 +30,27 @@
      只用于上传 115，**不保存到本地**（无下载弹框）；
    - **上传后立即重命名**：按原始文件名在目录中找到刚上传的图片，重命名为网页内容标题
      （115 自动保留扩展名）；
-4. **完成检测与处理**（后台异步，用户规范，效率优化版）：
+4. **完成检测与处理**（后台异步，用户规范）：
    - **转存后立即**把图片上传到「云下载」目录并重命名为网页内容标题（**不等磁力下载完成**）；
-   - **转存前**记录「云下载」目录现有条目；
-   - **转存后**轮询「云下载」目录（`GET https://webapi.115.com/files?aid=1&cid=<云下载cid>`，
-     每 2 秒一次，**最多 30 秒**），检测**新增目录**——data 列表中**有 `uid` 的是文件、
-     没有 `uid` 的是目录**，只看新增目录（提前上传的图片是文件，不会误触发；
-     文件/目录过多分页时也不会把文件当完成信号）；
-   - 通过新增目录的 **cid 进入该目录**；
-   - 进入目录后：把其中**最大的文件**重命名为网页内容标题
-     （`POST webapi.115.com/files/batch_rename`，传 `files_new_name[<fid>]=标题`）；
-   - 把之前上传的图片**从云下载目录移动到该目录**：
-     `POST https://webapi.115.com/files/move`，参数 `pid=<目标目录cid>`、`fid[0]=<图片fid>`。
+   - **记住任务凭证**：add_task_url 响应的 `infohash`（任务凭证）与 `name`（下载文件名）；
+   - **轮询任务状态**：`POST https://115.com/web/lixian/?ct=lixian&ac=task_lists`
+     （参数 `page=1&stat=12` 查询下载中任务）：遍历 `task` 列表，若对象 `url` 与本次
+     磁力链接相同 → 任务未完成（记录 `file_id`），继续轮询，**最多 30 秒**，超时提示下载超时；
+     下载中列表没有本次任务 → 改 `stat=11` 查询已完成任务，若 `url` 匹配 → 下载完成，取 `file_id`；
+     两个列表都没有 → 提示**下载失败**；
+   - **按 file_id 重命名**：在「云下载」目录中按任务的 `file_id` 定位下载产物——
+     **目录** → 进入并重命名其中最大的文件，然后**将该文件移动到云下载目录**；
+     **文件** → 直接重命名该文件（已在云下载目录，无需移动）
+     （`POST webapi.115.com/files/batch_rename` 重命名，`POST webapi.115.com/files/move`
+     移动，参数 `pid=<云下载cid>`、`fid[0]=<文件fid>`）；
+   - **图片不再移动**（留在云下载目录）。
 
 ## 文件结构
 
 ```
 115-magnet-helper/
 ├── manifest.json     # Manifest V3 配置（cookies / storage / alarms / declarativeNetRequest）
-├── background.js     # 后台 Service Worker：Cookie、转存、图片上传、完成检测 + 重命名 + 移动
+├── background.js     # 后台 Service Worker：Cookie、转存、图片上传、task_lists 轮询 + 按 file_id 重命名
 ├── content.js        # 内容脚本：分析按钮、弹框、内容标题/图片/磁力分析、查重、转存交互
 └── popup.html        # 点击工具栏图标时的说明弹窗
 ```

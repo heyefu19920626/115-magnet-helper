@@ -10,10 +10,11 @@
  *       若浏览器开启“下载前询问保存位置”，保存框由该设置决定，扩展 API 无法绕过）
  *     - 通过 chrome.cookies 读取图片域名 Cookie，与页面 Referer 一起经
  *       declarativeNetRequest 修改请求头，兜底获取被防盗链拦截的图片
- *  4. 转存前记录「云下载」目录现有条目；转存后轮询该目录（最多 30 秒），
- *     检测到新增目录/文件即视为下载完成，通过其 cid 进入对应目录
- *  5. 进入目录后：把其中最大的文件重命名为网页内容标题，并把图片上传到该目录
- *     （sampleinitupload + OSS），上传成功后把图片重命名为标题
+ *  4. 转存成功后记住任务凭证（add_task_url 响应的 infohash / name）；
+ *     用 task_lists（stat=12 下载中 → stat=11 已完成）按 url 轮询任务状态（30 秒超时），
+ *     拿到 file_id
+ *  5. 根据 file_id 在「云下载」目录定位下载产物：目录 → 重命名其中最大文件；
+ *     文件 → 直接重命名；图片已上传到云下载目录并重命名，不再移动
  */
 "use strict";
 
@@ -491,8 +492,19 @@ async function renameFile(fid, name) {
   };
 }
 
+/** 清理文件名中的非法字符 */
+function sanitizeFileName(name) {
+  return (
+    String(name || "")
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, " ")
+      .replace(/\s+/g, " ")
+      .replace(/^[. ]+|[. ]+$/g, "")
+      .slice(0, 200) || "未命名"
+  );
+}
+
 /**
- * 移动文件到指定目录（用户规范）
+ * 移动文件到指定目录
  * POST https://webapi.115.com/files/move
  * 参数：pid=<目标目录cid>，fid[0]=<文件id> ...
  */
@@ -516,17 +528,6 @@ async function moveFiles(pid, fileIds) {
   } catch (e) {
     return { ok: false, error_msg: e && e.message ? e.message : String(e) };
   }
-}
-
-/** 清理文件名中的非法字符 */
-function sanitizeFileName(name) {
-  return (
-    String(name || "")
-      .replace(/[\\/:*?"<>|\x00-\x1f]/g, " ")
-      .replace(/\s+/g, " ")
-      .replace(/^[. ]+|[. ]+$/g, "")
-      .slice(0, 200) || "未命名"
-  );
 }
 
 /**
@@ -582,7 +583,7 @@ async function renameLargestFileInDir(dirId, pageTitle, magnetName, tabId, tagSt
     await appendLog("error", tagStr + "重命名失败：" + res.error_msg);
     notifyTab(tabId, { type: "jobUpdate", ok: false, text: "重命名失败：" + res.error_msg });
   }
-  return res;
+  return { ...res, fid: largest.fid, n: largest.n, newName };
 }
 
 /* ================= 转存后的后台处理 ================= */
@@ -600,74 +601,194 @@ function notifyTab(tabId, payload) {
 }
 
 /**
- * 转存成功后异步处理（用户规范，效率优化版）：
- * 图片已在转存时立即上传到「云下载」目录并重命名；这里只负责：
- * 1) 转存前已记录「云下载」目录现有条目（beforeItems）
- * 2) 轮询「云下载」目录（最多 30 秒），检测新增【目录】（data 中有 uid 的是文件、
- *    无 uid 的是目录；只看新增目录，避免提前上传的图片等文件误触发）
- * 3) 进入目录后：重命名最大文件为标题 → 把图片从云下载目录移动到该目录（files/move）
+ * 从 add_task_url 响应中提取任务凭证（用户规范第 1 点）：
+ * infohash = 任务凭证；name = 下载文件的名称
  */
-async function watchNewDirAndProcess({ tabId, yunDirCid, beforeItems, pageTitle, magnetName, imageFid, imageRenameName }) {
-  const beforeKeys = new Set(beforeItems.map((it) => (it.isDir ? "D" : "F") + it.fid));
-  const deadline = Date.now() + COMPLETE_TIMEOUT;
-  let newItem = null;
-  let targetDir = "";
+function extractTaskInfo(json) {
+  try {
+    const d = json && json.data;
+    const t = (d && (d.tasks && d.tasks[0])) || (d && d.task) || null;
+    const src = t || d || json;
+    return {
+      infohash: src && (src.infohash || src.info_hash) ? String(src.infohash || src.info_hash) : "",
+      name: src && src.name ? String(src.name) : "",
+    };
+  } catch (e) {
+    return { infohash: "", name: "" };
+  }
+}
 
+/**
+ * 查询离线任务列表（用户规范第 2 点）
+ * POST https://115.com/web/lixian/?ct=lixian&ac=task_lists
+ * 参数：page=1&stat=12（下载中）或 stat=11（已完成）
+ * 返回 { count, tasks }
+ */
+async function fetchTaskListByStat(stat) {
+  const body = new URLSearchParams();
+  body.append("page", "1");
+  body.append("stat", String(stat));
+  const urls = [
+    "https://115.com/web/lixian/?ct=lixian&ac=task_lists",
+    "https://lixian.115.com/lixian/?ct=lixian&ac=task_lists",
+  ];
+  let lastErr = null;
+  for (const url of urls) {
+    try {
+      const json = await requestJson(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+        body: body.toString(),
+      });
+      const tasks = (json && json.tasks) || (json && json.data && json.data.tasks) || [];
+      const count =
+        Number((json && json.count != null ? json.count : json && json.data && json.data.count) || 0) || 0;
+      return { count, tasks: Array.isArray(tasks) ? tasks : [] };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("任务列表获取失败");
+}
+
+/** 判断任务是否属于本次下载：url 与磁力链接相同，或 infohash 一致（用户规范按 url 比较） */
+function taskMatches(task, magnetUrl, infohash) {
+  const tu = String((task && task.url) || "");
+  if (magnetUrl && tu === magnetUrl) return true;
+  if (infohash && task && task.info_hash) {
+    return String(task.info_hash).toLowerCase() === String(infohash).toLowerCase();
+  }
+  return false;
+}
+
+/**
+ * 轮询确定本次磁力下载的状态（用户规范第 2 点）：
+ * 1) stat=12 轮询下载中任务：url 匹配 → 任务未完成（记录 file_id），继续轮询，最多 30 秒，超时提示下载超时
+ * 2) 下载中列表没有本次任务 → stat=11 查询已完成任务：url 匹配 → 已完成，取 file_id
+ * 3) 两个列表都没有 → 下载失败
+ * 返回 { ok, fileId?, name?, error? }
+ */
+async function pollTaskCompletion(magnetUrl, infohash, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let sawDownloading = false;
+  let fileId = "";
   while (Date.now() < deadline) {
     try {
-      const cid = yunDirCid || (await getYunDownloadCid());
-      const items = await listFiles(cid);
-      // 用户规范：只看新增【目录】（文件可能因提前上传/分页被误判，目录最可靠）。
-      // 转存时上传的图片是文件，不会触发；真正的磁力下载完成会创建新目录。
-      const addedDirs = items.filter((it) => it.isDir && !beforeKeys.has("D" + it.fid));
-      if (addedDirs.length) {
-        newItem = addedDirs[0];
-        targetDir = newItem.fid; // 进入该目录
-        break;
+      const { tasks } = await fetchTaskListByStat(12);
+      const t = tasks.find((x) => taskMatches(x, magnetUrl, infohash));
+      if (t) {
+        sawDownloading = true;
+        if (t.file_id != null && String(t.file_id) !== "") fileId = String(t.file_id);
+      } else {
+        break; // 已不在下载中列表
       }
     } catch (e) {
       /* 下一轮再试 */
     }
     await sleep(POLL_INTERVAL);
   }
+  if (sawDownloading) {
+    return { ok: false, error: "115下载超时（30秒内未完成）" };
+  }
+  try {
+    const { tasks } = await fetchTaskListByStat(11);
+    const t = tasks.find((x) => taskMatches(x, magnetUrl, infohash));
+    if (t) {
+      return {
+        ok: true,
+        fileId: t.file_id != null ? String(t.file_id) : fileId,
+        name: t.name || "",
+      };
+    }
+  } catch (e) {
+    /* 落到失败 */
+  }
+  return { ok: false, error: "115下载失败（下载中与已完成任务中均未找到本次任务）" };
+}
 
-  if (!newItem) {
-    await appendLog("error", "30秒内未在云下载目录发现新增目录，视为下载失败");
-    notifyTab(tabId, { type: "jobUpdate", ok: false, text: "115下载失败：30秒内未检测到新增目录" });
+/**
+ * 根据任务的 file_id 在云下载目录中定位下载产物并重命名（用户规范第 3 点）：
+ * - 目录 → 进入该目录，重命名其中最大的文件
+ * - 文件 → 直接重命名该文件
+ * 图片已上传到云下载目录，不再移动
+ */
+async function renameFileById(yunDirCid, fileId, pageTitle, magnetName, tabId) {
+  if (!fileId) {
+    const msg = "未获取到任务的 file_id，无法定位下载文件";
+    await appendLog("error", msg);
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: msg });
     return;
   }
-
-  await appendLog("ok", "检测到新增目录：「" + newItem.n + "」（cid=" + targetDir + "），进入该目录处理");
-  notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115下载完成，进入目录：「" + newItem.n + "」" });
-
-  // 1) 重命名目录中最大的文件为标题
-  await renameLargestFileInDir(targetDir, pageTitle, magnetName, tabId, "");
-
-  // 2) 把转存时上传到云下载目录的图片移动到对应目录（files/move）
-  if (imageFid || imageRenameName) {
-    let fid = imageFid;
-    // fid 缺失时按重命名后的文件名在云下载目录中找回
-    if (!fid && imageRenameName && yunDirCid) {
-      try {
-        const items = await listFiles(yunDirCid);
-        const f = items.find((it) => !it.isDir && it.n === imageRenameName);
-        if (f) fid = f.fid;
-      } catch (e) {
-        /* ignore */
-      }
-    }
-    if (!fid) {
-      await appendLog("error", "未找到图片的 fid，跳过移动到对应目录");
-      notifyTab(tabId, { type: "jobUpdate", ok: false, text: "未找到图片，跳过移动到对应目录" });
-      return;
-    }
-    const mv = await moveFiles(targetDir, [fid]);
-    await appendLog(
-      mv.ok ? "ok" : "error",
-      "移动图片到目录 cid=" + targetDir + "：" + (mv.ok ? "成功" : "失败：" + mv.error_msg)
-    );
-    notifyTab(tabId, { type: "jobUpdate", ok: mv.ok, text: mv.ok ? "图片已移动到对应目录" : "图片移动失败：" + mv.error_msg });
+  let items = [];
+  try {
+    items = await listFiles(yunDirCid);
+  } catch (e) {
+    const msg = "列出云下载目录失败：" + (e && e.message ? e.message : e);
+    await appendLog("error", msg);
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: msg });
+    return;
   }
+  const target = items.find((it) => it.fid === String(fileId));
+  if (!target) {
+    const msg = "未在云下载目录中找到 file_id=" + fileId + " 对应的文件/目录";
+    await appendLog("error", msg);
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: msg });
+    return;
+  }
+  if (target.isDir) {
+    // 目录：进入并重命名其中最大的文件，然后移动到云下载目录
+    await appendLog(
+      "info",
+      "file_id 对应目录：「" + target.n + "」（cid=" + target.fid + "），重命名其中最大文件"
+    );
+    notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115下载完成，进入目录：「" + target.n + "」" });
+    const r = await renameLargestFileInDir(target.fid, pageTitle, magnetName, tabId, "");
+    if (r && r.ok && r.fid) {
+      // 重命名成功后，把该文件移动到云下载目录（用户规范第 1 点）
+      const mv = await moveFiles(yunDirCid, [r.fid]);
+      await appendLog(
+        mv.ok ? "ok" : "error",
+        "移动重命名后的文件到云下载目录：" + (mv.ok ? "成功" : "失败：" + mv.error_msg)
+      );
+      notifyTab(tabId, { type: "jobUpdate", ok: mv.ok, text: mv.ok ? "文件已移动到云下载目录" : "文件移动失败：" + mv.error_msg });
+    }
+    return;
+  }
+  // 文件：直接重命名（已在云下载目录，无需移动）
+  const newName = sanitizeFileName(pageTitle || magnetName || "未命名");
+  let res;
+  try {
+    res = await renameFile(target.fid, newName);
+  } catch (e) {
+    res = { ok: false, error_msg: e && e.message ? e.message : String(e) };
+  }
+  if (res.ok) {
+    await appendLog("ok", "重命名成功：" + target.n + " → " + newName);
+    notifyTab(tabId, { type: "jobUpdate", ok: true, text: "已将下载文件重命名为：" + newName });
+  } else {
+    await appendLog("error", "重命名失败：" + res.error_msg);
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: "重命名失败：" + res.error_msg });
+  }
+}
+
+/**
+ * 转存成功后异步监控（用户规范）：
+ * 1) 用 task_lists（stat=12 → stat=11）按 url 轮询本次任务，确定下载状态并取 file_id
+ * 2) 根据 file_id 在云下载目录定位文件/目录并重命名（图片不再移动）
+ */
+async function watchTaskAndRename({ tabId, yunDirCid, magnetUrl, magnetName, pageTitle, infohash, taskName }) {
+  const r = await pollTaskCompletion(magnetUrl, infohash, COMPLETE_TIMEOUT);
+  if (!r.ok) {
+    await appendLog("error", r.error);
+    notifyTab(tabId, { type: "jobUpdate", ok: false, text: r.error });
+    return;
+  }
+  await appendLog(
+    "ok",
+    "115下载完成：file_id=" + r.fileId + "，任务名=" + (r.name || taskName || "（未知）")
+  );
+  notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115 下载完成，正在重命名文件…" });
+  await renameFileById(yunDirCid, r.fileId, pageTitle, magnetName, tabId);
 }
 
 /** 提取标题最前面的字母-数字（番号，如 "MIAB-481"） */
@@ -738,15 +859,13 @@ async function handleTransferMagnet(msg, sender) {
       "，内容脚本已取字节=" + (haveBytes ? "是" : "否")
   );
 
-  // 0) 转存前：记录「云下载」目录现有条目（用于之后检测新增目录/文件）
+  // 0) 获取「云下载」目录 cid（图片上传目标 + 完成后定位下载产物）
   let yunDirCid = "";
-  let beforeItems = [];
   try {
     yunDirCid = await getYunDownloadCid();
-    beforeItems = await listFiles(yunDirCid);
-    await appendLog("info", "转存前云下载目录（cid=" + yunDirCid + "）现有条目 " + beforeItems.length + " 项");
+    await appendLog("info", "云下载目录 cid=" + yunDirCid);
   } catch (e) {
-    await appendLog("info", "转存前获取云下载目录失败，稍后重试：" + (e && e.message ? e.message : e));
+    await appendLog("info", "获取云下载目录失败，稍后重试：" + (e && e.message ? e.message : e));
   }
 
   // 1) 添加任务 + 图片处理（获取字节，不保存本地）同时进行
@@ -765,7 +884,17 @@ async function handleTransferMagnet(msg, sender) {
     "图片处理结果：" + (imageRes.ok ? "已获取字节（" + imageRes.size + " 字节）" : "失败：" + (imageRes.error || ""))
   );
 
-  // 2) 立即上传图片到「云下载」目录并重命名为标题（效率优化：不等磁力下载完成）
+  // 记住任务凭证（用户规范第 1 点）：infohash = 任务凭证，name = 下载文件的名称
+  const taskInfo = extractTaskInfo(res.data);
+  if (res.ok) {
+    await appendLog(
+      "info",
+      "任务凭证：infohash=" + (taskInfo.infohash || "（响应中未找到）") +
+        "，name=" + (taskInfo.name || "（响应中未找到）")
+    );
+  }
+
+  // 2) 立即上传图片到「云下载」目录并重命名为标题（不等磁力下载完成；图片不再移动）
   if (!yunDirCid) {
     try {
       yunDirCid = await getYunDownloadCid();
@@ -790,17 +919,17 @@ async function handleTransferMagnet(msg, sender) {
     }
   }
 
-  // 3) 转存成功后：后台轮询磁力下载完成 → 重命名目录最大文件 → 把图片移动到对应目录
+  // 3) 转存成功后：用 task_lists 轮询任务状态（stat=12→11）→ 按 file_id 定位并重命名
   if (res.ok) {
     notifyTab(tabId, { type: "jobUpdate", ok: true, text: "转存成功，正在等待115下载完成（30秒内）…" });
-    watchNewDirAndProcess({
+    watchTaskAndRename({
       tabId,
       yunDirCid,
-      beforeItems,
-      pageTitle,
+      magnetUrl,
       magnetName,
-      imageFid: imageRename && imageRename.ok ? imageRename.fid : "",
-      imageRenameName: imageRename && imageRename.ok ? imageRename.name : "",
+      pageTitle,
+      infohash: taskInfo.infohash,
+      taskName: taskInfo.name,
     }); // 异步，不阻塞响应
   }
 
