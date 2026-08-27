@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "115 磁力分析助手",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "javdb/javbus 磁力分析：自动查重（番号xxx已存在）、一键转存115、下载并上传封面、完成后重命名最大文件",
   "permissions": [
     "cookies",
