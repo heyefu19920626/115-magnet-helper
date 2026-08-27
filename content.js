@@ -203,59 +203,55 @@
 
   /**
    * 从网页内容中获取「以字母/数字开头的完整标题」（不使用 document.title）：
-   * 按优先级收集候选文本——站点专属（h2.current-title / h3.sav-id.infoFirst）→
-   * 磁力链接文字 / dn 参数 / title 类元素 / 标题元素 / 普通链接 / 文本块，
-   * 过滤出以 [A-Za-z0-9] 开头、长度合适的“标题”，每类取最长的一个，按优先级返回。
+   * 按优先级收集候选文本——站点专属（sav-id / current-title 所在标题容器）→
+   * title 类元素 / 标题元素 / 普通链接 / 文本块。
+   * 下载链接（magnet / ed2k）相关的文字一律不作为标题候选（避免 ed2k 磁力变成标题），
+   * 每类取最长的一个，按优先级返回。
    */
   function getContentTitle() {
     const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
     const isTitleLike = (t) => t.length >= 4 && t.length <= 300 && /^[A-Za-z0-9]/.test(t);
     const isShortTitleLike = (t) => t.length >= 3 && t.length <= 300 && /^[A-Za-z0-9]/.test(t);
+    // 下载链接特征：ed2k 文件链接 / magnet 链接
+    const isDownloadish = (t) => /ed2k:\/\/\|file\|/i.test(t) || /^magnet:\?/i.test(t);
 
     const siteTexts = getSiteSpecificTitleCandidates();
-    const magnetTexts = [];
-    const dnNames = [];
     const titleElTexts = [];
     const headingTexts = [];
     const linkTexts = [];
     const blockTexts = [];
 
-    // 1) 磁力链接的文字（资源标题的最强候选）
-    for (const a of document.querySelectorAll('a[href^="magnet:" i]')) {
-      const t = clean(a.textContent);
-      if (t) magnetTexts.push(t);
-      const dn = getParam(a.getAttribute("href") || "", "dn");
-      if (dn) dnNames.push(clean(dn));
-    }
-    // 2) title/name 类元素
+    // 1) title/name 类元素
     for (const el of document.querySelectorAll(
       '[id*="title" i], [class*="title" i], [itemprop="name"], [class*="subject" i], [class*="name" i]'
     )) {
       const t = clean(el.textContent);
       if (t) titleElTexts.push(t);
     }
-    // 3) 标题元素
+    // 2) 标题元素
     for (const el of document.querySelectorAll("h1,h2,h3,h4,h5,h6")) {
       const t = clean(el.textContent);
       if (t) headingTexts.push(t);
     }
-    // 4) 普通链接文字
+    // 3) 普通链接文字（排除 magnet/ed2k 下载链接）
     for (const a of document.querySelectorAll("a")) {
+      if (/^(magnet|ed2k):/i.test(a.getAttribute("href") || "")) continue;
       const t = clean(a.textContent);
       if (t) linkTexts.push(t);
     }
-    // 5) 文本块
+    // 4) 文本块
     for (const el of document.querySelectorAll("p, td, li, article, section")) {
       const t = clean(el.textContent);
       if (t) blockTexts.push(t);
     }
 
     const longest = (arr, filter) =>
-      arr.filter(filter || isTitleLike).sort((a, b) => b.length - a.length)[0] || "";
+      arr
+        .filter(filter || isTitleLike)
+        .filter((t) => !isDownloadish(t))
+        .sort((a, b) => b.length - a.length)[0] || "";
     return (
       longest(siteTexts, isShortTitleLike) ||
-      longest(magnetTexts) ||
-      longest(dnNames) ||
       longest(titleElTexts) ||
       longest(headingTexts) ||
       longest(linkTexts) ||
@@ -266,22 +262,103 @@
 
   /** 支持的下载链接前缀：magnet 磁力、ed2k 电驴 */
   const LINK_PREFIXES = ["magnet:", "ed2k:"];
+  // 下载链接特征正则：ed2k 大小字段可省略，结尾可带 "/"
+  const LINK_RE = /(ed2k:\/\/\|file\|[^|]+\|\d*\|[0-9a-fA-F]+\|\/?|magnet:\?[^\s"'<>]+)/gi;
+  const LINK_HINT_RE = /(ed2k:\/\/\|file\||magnet:\?)/i;
 
-  /** 分析页面中所有下载链接（magnet/ed2k），按大小从大到小排序（未知大小排最后） */
-  function analyzePage() {
-    const anchors = [];
-    for (const p of LINK_PREFIXES) {
-      anchors.push(...document.querySelectorAll('a[href^="' + p + '" i]'));
+  /** 清理提取出的 URL 尾部标点 */
+  function cleanLinkUrl(url) {
+    return String(url || "").trim().replace(/[,.;:)\]}>"'、。，]+$/, "");
+  }
+
+  /**
+   * 从文本节点中提取下载链接（magnet / ed2k）
+   * 部分页面动态加载的内容里，ed2k 磁力可能以纯文本或非标准锚点展示
+   * （如 href="javascript:void(0)"、URL 直接写在文字里）。
+   * doc 可指定（用于扫描同源 iframe）。
+   */
+  function extractTextLinks(doc) {
+    const root = (doc || document).body || (doc || document).documentElement;
+    const found = [];
+    try {
+      const walker = (doc || document).createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        const text = node.nodeValue || "";
+        if (!LINK_HINT_RE.test(text)) continue;
+        LINK_RE.lastIndex = 0;
+        let m;
+        while ((m = LINK_RE.exec(text))) {
+          const url = cleanLinkUrl(m[0]);
+          if (url) found.push({ url, el: node.parentElement });
+        }
+      }
+    } catch (e) {
+      /* ignore */
     }
-    const seen = new Set();
+    return found;
+  }
+
+  /** 从元素的 data-* 属性中提取下载链接（如 data-clipboard-text 复制按钮） */
+  function extractAttrLinks(doc) {
+    const found = [];
+    try {
+      const els = (doc || document).querySelectorAll(
+        "[data-clipboard-text], [data-url], [data-link], [data-magnet], [data-ed2k]"
+      );
+      for (const el of els) {
+        for (const attr of ["data-clipboard-text", "data-url", "data-link", "data-magnet", "data-ed2k"]) {
+          const v = el.getAttribute(attr);
+          if (v && /^(magnet:|ed2k:)/i.test(v.trim())) found.push({ url: v.trim(), el });
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return found;
+  }
+
+  /**
+   * 从容器元素的 textContent 中提取下载链接：
+   * URL 可能被标签拆成多段（如 <span>ed2k://|file|名字</span><span>|大小|哈希|/</span>），
+   * 单个文本节点扫不到，textContent 拼接后可以匹配。
+   */
+  function extractContainerLinks(doc) {
+    const found = [];
+    try {
+      const els = (doc || document).querySelectorAll(
+        "a, p, td, li, div, span, article, section, blockquote, pre, code"
+      );
+      for (const el of els) {
+        const t = el.textContent || "";
+        if (!t || t.length > 1000) continue; // 跳过超大容器（其子元素会单独扫描），控制性能
+        if (!LINK_HINT_RE.test(t)) continue;
+        if (el.querySelector && el.querySelector("a[href^='magnet:'], a[href^='ed2k:']")) continue; // 锚点已覆盖，避免重复
+        LINK_RE.lastIndex = 0;
+        let m;
+        while ((m = LINK_RE.exec(t))) {
+          const url = cleanLinkUrl(m[0]);
+          if (url) found.push({ url, el });
+        }
+      }
+    } catch (e) {
+      /* ignore */
+    }
+    return found;
+  }
+
+  /** 分析页面中所有下载链接（magnet/ed2k：标准锚点 + 文本/属性/容器 + 同源 iframe），按大小从大到小排序 */
+  function analyzePage() {
     const items = [];
-    for (const a of anchors) {
-      const href = (a.getAttribute("href") || "").trim();
-      if (!href) continue;
-      const key = keyOf(href);
-      if (seen.has(key)) continue;
-      seen.add(key);
+    const seen = new Set();
+    const addItem = (href, a) => {
+      href = String(href || "").trim();
+      if (!href) return;
       const type = /^magnet:/i.test(href) ? "magnet" : /^ed2k:/i.test(href) ? "ed2k" : "";
+      if (!type) return;
+      const key = keyOf(href);
+      if (seen.has(key)) return;
+      seen.add(key);
       const sizeText = extractSize(href, a, type);
       const xl = type === "magnet" ? getParam(href, "xl") : null;
       items.push({
@@ -290,7 +367,35 @@
         size: sizeText,
         bytes: xl && /^\d+$/.test(xl) ? parseInt(xl, 10) : parseSizeBytes(sizeText),
       });
+    };
+
+    const scanDoc = (doc) => {
+      // 1) 标准锚点链接
+      for (const p of LINK_PREFIXES) {
+        for (const a of doc.querySelectorAll('a[href^="' + p + '" i]')) {
+          addItem(a.getAttribute("href"), a);
+        }
+      }
+      // 2) 文本节点中的链接
+      for (const { url, el } of extractTextLinks(doc)) addItem(url, el);
+      // 3) data-* 属性中的链接
+      for (const { url, el } of extractAttrLinks(doc)) addItem(url, el);
+      // 4) 容器 textContent 中的链接（URL 被标签拆开时）
+      for (const { url, el } of extractContainerLinks(doc)) addItem(url, el);
+    };
+
+    scanDoc(document);
+    // 同源 iframe 内容（跨域 iframe 无法访问，跳过）
+    for (const frame of document.querySelectorAll("iframe")) {
+      let doc = null;
+      try {
+        doc = frame.contentDocument;
+      } catch (e) {
+        continue;
+      }
+      if (doc) scanDoc(doc);
     }
+
     items.sort((a, b) => b.bytes - a.bytes); // 从大到小；未知(-1)沉底
     return items;
   }
@@ -632,12 +737,16 @@
     toastTimer = setTimeout(() => toast.classList.remove("show"), 5000);
   }
 
+  let panelOpen = false; // 弹框是否打开（用于动态内容自动刷新）
+
   function openPanel() {
+    panelOpen = true;
     mask.style.display = "";
     panel.style.display = "";
   }
 
   function closePanel() {
+    panelOpen = false;
     mask.style.display = "none";
     panel.style.display = "none";
     // 关闭时若处于日志视图，重置为分析视图状态
@@ -987,4 +1096,81 @@
       /* 静默失败，不影响分析按钮 */
     }
   })();
+
+  // 监听页面动态加载的下载链接（切换标签等触发的新元素）：
+  // 弹框打开时自动重新分析并刷新列表，识别新出现的 magnet/ed2k 链接
+  let refreshTimer = null;
+  function refreshAnalysis(items) {
+    if (!panelOpen || logMode) return;
+    const list = items || analyzePage();
+    lastRender.items = list;
+    render(list, lastRender.title, lastRender.imageUrl, lastRender.imageName);
+  }
+  const dynamicObserver = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.type !== "childList" || !m.addedNodes.length) continue;
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        const hasLink =
+          (node.matches && node.matches('a[href^="magnet:" i], a[href^="ed2k:" i]')) ||
+          (node.querySelectorAll &&
+            node.querySelectorAll('a[href^="magnet:" i], a[href^="ed2k:" i]').length > 0) ||
+          (node.textContent && LINK_HINT_RE.test(node.textContent));
+        if (hasLink) {
+          if (panelOpen && !logMode) {
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(refreshAnalysis, 300); // 防抖
+          }
+          return;
+        }
+      }
+    }
+  });
+  try {
+    dynamicObserver.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {
+    /* 观察失败不影响使用 */
+  }
+
+  // 兜底：弹框打开期间定时自动重扫（覆盖 AJAX / innerHTML / SPA 等一切加载方式），
+  // 同时检测 URL 变化（SPA 导航）并重新查重按钮状态
+  let lastLinksSignature = "";
+  let lastUrl = location.href;
+  setInterval(() => {
+    // SPA 导航：URL 变化 → 重新查重（更新按钮/弹框提示）
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      checkMovieExists(getContentTitle());
+      (async () => {
+        try {
+          const title = getContentTitle();
+          if (!title) return;
+          const res = await sendMessage({ type: "searchExisting", title });
+          if (res && res.ok) {
+            const code = res.searchValue || "";
+            fab.title = "点击仍可分析（" + title + "）";
+            if (res.exists) {
+              fab.textContent = "番号" + code + "已存在";
+              fab.className = "m115-fab exists";
+            } else {
+              fab.textContent = "番号" + code + "未保存";
+              fab.className = "m115-fab missing";
+            }
+          }
+        } catch (e) {
+          /* ignore */
+        }
+      })();
+    }
+    // 弹框打开时：链接集合变化 → 刷新列表
+    if (panelOpen && !logMode) {
+      const items = analyzePage();
+      const sig = items.map((it) => it.url).join("\n");
+      if (sig !== lastLinksSignature) {
+        lastLinksSignature = sig;
+        clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => refreshAnalysis(items), 150);
+      }
+    }
+  }, 1500);
 })();

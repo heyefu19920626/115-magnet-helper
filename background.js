@@ -12,8 +12,8 @@
  *       declarativeNetRequest 修改请求头，兜底获取被防盗链拦截的图片
  *  4. 转存成功后记住任务凭证（add_task_url 响应的 infohash / name）；
  *     用 task_lists（stat=12 下载中 → stat=11 已完成）按 url 轮询任务状态（30 秒超时），
- *     拿到 file_id
- *  5. 根据 file_id 在「云下载」目录定位下载产物：目录 → 重命名其中最大文件；
+ *     拿到任务的 delete_file_id（作为文件的 id）
+ *  5. 根据 delete_file_id 在「云下载」目录定位下载产物：目录 → 重命名其中最大文件；
  *     文件 → 直接重命名；图片已上传到云下载目录并重命名，不再移动
  */
 "use strict";
@@ -663,10 +663,10 @@ function taskMatches(task, magnetUrl, infohash) {
 
 /**
  * 轮询确定本次磁力下载的状态（用户规范第 2 点）：
- * 1) stat=12 轮询下载中任务：url 匹配 → 任务未完成（记录 file_id），继续轮询，最多 30 秒，超时提示下载超时
- * 2) 下载中列表没有本次任务 → stat=11 查询已完成任务：url 匹配 → 已完成，取 file_id
+ * 1) stat=12 轮询下载中任务：url 匹配 → 任务未完成（记录 delete_file_id），继续轮询，最多 30 秒，超时提示下载超时
+ * 2) 下载中列表没有本次任务 → stat=11 查询已完成任务：url 匹配 → 已完成，取 delete_file_id
  * 3) 两个列表都没有 → 下载失败
- * 返回 { ok, fileId?, name?, error? }
+ * 返回 { ok, fileId?, name?, error? }（fileId 即任务的 delete_file_id）
  */
 async function pollTaskCompletion(magnetUrl, infohash, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -678,7 +678,7 @@ async function pollTaskCompletion(magnetUrl, infohash, timeoutMs) {
       const t = tasks.find((x) => taskMatches(x, magnetUrl, infohash));
       if (t) {
         sawDownloading = true;
-        if (t.file_id != null && String(t.file_id) !== "") fileId = String(t.file_id);
+        if (t.delete_file_id != null && String(t.delete_file_id) !== "") fileId = String(t.delete_file_id);
       } else {
         break; // 已不在下载中列表
       }
@@ -696,7 +696,7 @@ async function pollTaskCompletion(magnetUrl, infohash, timeoutMs) {
     if (t) {
       return {
         ok: true,
-        fileId: t.file_id != null ? String(t.file_id) : fileId,
+        fileId: t.delete_file_id != null ? String(t.delete_file_id) : fileId,
         name: t.name || "",
       };
     }
@@ -707,14 +707,14 @@ async function pollTaskCompletion(magnetUrl, infohash, timeoutMs) {
 }
 
 /**
- * 根据任务的 file_id 在云下载目录中定位下载产物并重命名（用户规范第 3 点）：
+ * 根据任务的 delete_file_id 在云下载目录中定位下载产物并重命名（用户规范第 3 点）：
  * - 目录 → 进入该目录，重命名其中最大的文件
  * - 文件 → 直接重命名该文件
  * 图片已上传到云下载目录，不再移动
  */
 async function renameFileById(yunDirCid, fileId, pageTitle, magnetName, tabId) {
   if (!fileId) {
-    const msg = "未获取到任务的 file_id，无法定位下载文件";
+    const msg = "未获取到任务的 delete_file_id，无法定位下载文件";
     await appendLog("error", msg);
     notifyTab(tabId, { type: "jobUpdate", ok: false, text: msg });
     return;
@@ -730,7 +730,7 @@ async function renameFileById(yunDirCid, fileId, pageTitle, magnetName, tabId) {
   }
   const target = items.find((it) => it.fid === String(fileId));
   if (!target) {
-    const msg = "未在云下载目录中找到 file_id=" + fileId + " 对应的文件/目录";
+    const msg = "未在云下载目录中找到 delete_file_id=" + fileId + " 对应的文件/目录";
     await appendLog("error", msg);
     notifyTab(tabId, { type: "jobUpdate", ok: false, text: msg });
     return;
@@ -739,7 +739,7 @@ async function renameFileById(yunDirCid, fileId, pageTitle, magnetName, tabId) {
     // 目录：进入并重命名其中最大的文件，然后移动到云下载目录
     await appendLog(
       "info",
-      "file_id 对应目录：「" + target.n + "」（cid=" + target.fid + "），重命名其中最大文件"
+      "delete_file_id 对应目录：「" + target.n + "」（cid=" + target.fid + "），重命名其中最大文件"
     );
     notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115下载完成，进入目录：「" + target.n + "」" });
     const r = await renameLargestFileInDir(target.fid, pageTitle, magnetName, tabId, "");
@@ -773,8 +773,8 @@ async function renameFileById(yunDirCid, fileId, pageTitle, magnetName, tabId) {
 
 /**
  * 转存成功后异步监控（用户规范）：
- * 1) 用 task_lists（stat=12 → stat=11）按 url 轮询本次任务，确定下载状态并取 file_id
- * 2) 根据 file_id 在云下载目录定位文件/目录并重命名（图片不再移动）
+ * 1) 用 task_lists（stat=12 → stat=11）按 url 轮询本次任务，确定下载状态并取 delete_file_id
+ * 2) 根据 delete_file_id 在云下载目录定位文件/目录并重命名（图片不再移动）
  */
 async function watchTaskAndRename({ tabId, yunDirCid, magnetUrl, magnetName, pageTitle, infohash, taskName }) {
   const r = await pollTaskCompletion(magnetUrl, infohash, COMPLETE_TIMEOUT);
@@ -785,7 +785,7 @@ async function watchTaskAndRename({ tabId, yunDirCid, magnetUrl, magnetName, pag
   }
   await appendLog(
     "ok",
-    "115下载完成：file_id=" + r.fileId + "，任务名=" + (r.name || taskName || "（未知）")
+    "115下载完成：delete_file_id=" + r.fileId + "，任务名=" + (r.name || taskName || "（未知）")
   );
   notifyTab(tabId, { type: "jobUpdate", ok: true, text: "115 下载完成，正在重命名文件…" });
   await renameFileById(yunDirCid, r.fileId, pageTitle, magnetName, tabId);
@@ -919,7 +919,7 @@ async function handleTransferMagnet(msg, sender) {
     }
   }
 
-  // 3) 转存成功后：用 task_lists 轮询任务状态（stat=12→11）→ 按 file_id 定位并重命名
+  // 3) 转存成功后：用 task_lists 轮询任务状态（stat=12→11）→ 按 delete_file_id 定位并重命名
   if (res.ok) {
     notifyTab(tabId, { type: "jobUpdate", ok: true, text: "转存成功，正在等待115下载完成（30秒内）…" });
     watchTaskAndRename({
