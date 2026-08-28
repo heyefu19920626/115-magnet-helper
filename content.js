@@ -113,22 +113,32 @@
    *    <strong class="current-title">（影片标题），取 h2 完整文本 → "AKDLD-363 【...】若葉結希"
    *  - javbus.com：<h3> 内含 <savdiv class="sav-id infoFirst">（番号）+ 标题文字，
    *    取 h3 完整文本 → "START-607 おねだり...恋渕ももな"
-   *  - 两者都只保留「以字母/数字开头」的内容（组合后以番号开头，自然满足）
+   *  - 优先使用真实标题标签（h1~h6）内的完整文本（用户规范：先确认 h2，其层级最少）；
+   *    只有不存在标题标签候选时才回退到父元素（避免把列表页 div.video-title 等
+   *    过长的文字当成标题）
+   *  - 只保留「以字母/数字开头」的内容（组合后以番号开头，自然满足）
    */
   function getSiteSpecificTitleCandidates() {
     const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
-    const out = [];
-    // 找到 .current-title 或 .sav-id 元素，取其所在标题容器（h1~h6）的完整文本
+    const headingBased = [];
+    const nonHeading = [];
+    // 找到 .current-title 或 .sav-id 元素：
+    //  - 在标题标签（h1~h6）内 → 取该标题标签的完整文本（最高优先级）
+    //  - 不在标题标签内 → 仅当没有标题标签候选时才回退取其父元素文本
     for (const sel of [".current-title", ".sav-id"]) {
       for (const el of document.querySelectorAll(sel)) {
-        const container = el.closest("h1,h2,h3,h4,h5,h6") || el.parentElement;
+        const heading = el.closest("h1,h2,h3,h4,h5,h6");
+        const container = heading || el.parentElement;
         if (!container) continue;
         const t = clean(container.textContent);
-        if (t && /^[A-Za-z0-9]/.test(t)) out.push(t);
+        if (t && /^[A-Za-z0-9]/.test(t)) {
+          (heading ? headingBased : nonHeading).push(t);
+        }
       }
     }
-    // 去重（保持顺序）
-    return out.filter((t, i) => out.indexOf(t) === i);
+    const dedupe = (arr) => arr.filter((t, i) => arr.indexOf(t) === i);
+    // 优先标题标签候选；不存在时（如列表页）才用父元素候选
+    return dedupe(headingBased).length ? dedupe(headingBased) : dedupe(nonHeading);
   }
 
   /**
@@ -818,56 +828,72 @@
     sendMessage({ type: "logEvent", msg: "点击转存：" + item.url + "（名称：" + item.name + "）" }).catch(() => {});
 
     // 页面上下文获取图片字节：
-    // 1) 先让后台注册 webRequest 注入：强制给该图片请求加上 Referer = 当前页面地址
-    //    （用户规范：Referer: cur_url）。内容脚本 fetch 可能不携带页面来源，
-    //    或页面引用策略会剥掉 Referer，webRequest 注入最可靠
-    // 2) fetch 并记录实际使用的 URL / Referer / 结果到日志，便于核对
+    // 仅 javbus 需要注入 Referer（用户规范：Referer: cur_url）；javdb 不需要，
+    // 按页面自然请求（浏览器自动带来源/Cookie）即可
     let imageBytes = null;
     if (lastAnalysis.imageUrl) {
       const imageUrl = lastAnalysis.imageUrl;
-      const referer = location.href; // 当前页面地址 = Referer
-      // 注册 DNR 注入（返回规则 id，取完后注销）
+      const referer = location.href; // 当前页面地址 = Referer（仅 javbus 使用）
+      const needRefererInjection = /(^|\.)javbus\.com$/i.test(location.hostname);
+      // 仅 javbus：注册 DNR 注入（返回规则 id，取完后注销）
       let imgRuleId = null;
-      try {
-        const reg = await sendMessage({
-          type: "registerImageHeaders",
-          url: imageUrl,
-          referer: referer,
-          timeout: 30000,
-        }).catch(() => null);
-        imgRuleId = reg && reg.ruleId ? reg.ruleId : null;
-      } catch (e) {
-        /* 注入注册失败不阻塞 */
+      if (needRefererInjection) {
+        try {
+          const reg = await sendMessage({
+            type: "registerImageHeaders",
+            url: imageUrl,
+            referer: referer,
+            timeout: 30000,
+          }).catch(() => null);
+          imgRuleId = reg && reg.ruleId ? reg.ruleId : null;
+        } catch (e) {
+          /* 注入注册失败不阻塞 */
+        }
       }
-      try {
-        const r = await fetch(imageUrl, {
-          credentials: "include",
-          referrer: referer,
-          referrerPolicy: "unsafe-url",
-        });
-        if (r.ok) {
-          const ct = r.headers.get("content-type") || "";
-          if (!ct || /^image\//i.test(ct)) {
-            imageBytes = await r.arrayBuffer();
-            sendMessage({
-              type: "logEvent",
-              msg: "图片下载成功：url=" + imageUrl + "，Referer=" + referer + "（HTTP 200，" + imageBytes.byteLength + " 字节）",
-            }).catch(() => {});
-          } else {
-            sendMessage({ type: "logEvent", msg: "页面内图片不是图片类型：" + ct }).catch(() => {});
+      // fetch（偶发网络失败如 Failed to fetch 时重试一次）
+      const fetchOpts = { credentials: "include" };
+      if (needRefererInjection) {
+        fetchOpts.referrer = referer; // javbus 强制发送完整页面地址
+        fetchOpts.referrerPolicy = "unsafe-url";
+      }
+      let lastErr = "";
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const r = await fetch(imageUrl, fetchOpts);
+          if (r.ok) {
+            const ct = r.headers.get("content-type") || "";
+            if (!ct || /^image\//i.test(ct)) {
+              imageBytes = await r.arrayBuffer();
+              sendMessage({
+                type: "logEvent",
+                msg: "图片下载成功：url=" + imageUrl + "，Referer=" + (needRefererInjection ? referer : "（自然来源）") + "（HTTP 200，" + imageBytes.byteLength + " 字节）",
+              }).catch(() => {});
+            } else {
+              sendMessage({ type: "logEvent", msg: "页面内图片不是图片类型：" + ct }).catch(() => {});
+            }
+            break; // 成功或非图片类型即停止
           }
-        } else {
+          lastErr = "HTTP " + r.status;
+          if (attempt < 2) {
+            await new Promise((res) => setTimeout(res, 800));
+            continue;
+          }
           sendMessage({
             type: "logEvent",
-            msg: "图片下载失败：url=" + imageUrl + "，Referer=" + referer + "（HTTP " + r.status + "），转后台兜底",
+            msg: "图片下载失败：url=" + imageUrl + "，Referer=" + (needRefererInjection ? referer : "（自然来源）") + "（" + lastErr + "），转后台兜底",
+          }).catch(() => {});
+        } catch (e) {
+          lastErr = e && e.message ? e.message : String(e);
+          if (attempt < 2) {
+            await new Promise((res) => setTimeout(res, 800));
+            continue;
+          }
+          // 跨域图片会被 CORS 拦截，转后台兜底（javbus 注入 Referer/Cookie；javdb 直连）
+          sendMessage({
+            type: "logEvent",
+            msg: "页面内获取图片被拦截（可能跨域 CORS）：" + lastErr + "，url=" + imageUrl + "，Referer=" + (needRefererInjection ? referer : "（自然来源）") + "，转后台兜底",
           }).catch(() => {});
         }
-      } catch (e) {
-        // 跨域图片会被 CORS 拦截，转后台用 webRequest 注入 Referer/Cookie 兜底
-        sendMessage({
-          type: "logEvent",
-          msg: "页面内获取图片被拦截（可能跨域 CORS）：" + (e && e.message ? e.message : e) + "，url=" + imageUrl + "，Referer=" + referer + "，转后台兜底",
-        }).catch(() => {});
       }
       // 取完即注销注入规则
       if (imgRuleId) {
@@ -997,9 +1023,18 @@
     renderLog();
   });
 
+  /** 格式化"已存在"文案：番号xxx已存在<所在目录>中（目录来自查重响应第一个匹配项） */
+  function formatExistsText(code, res) {
+    let dirName = "";
+    if (res && res.matches && res.matches.length && res.matches[0].dirName) {
+      dirName = res.matches[0].dirName;
+    }
+    return "番号" + code + "已存在" + (dirName ? dirName + "中" : "");
+  }
+
   /**
    * 查重：用标题最前面的字母-数字（番号）查询 115，
-   * 已存在 → 红色「番号xxx已存在」；未保存 → 蓝色「番号xxx未保存」
+   * 已存在 → 红色「番号xxx已存在[于xxx中]」；未保存 → 蓝色「番号xxx未保存」
    */
   async function checkMovieExists(title) {
     existsEl.textContent = "";
@@ -1016,7 +1051,7 @@
       existsEl.style.display = "";
       if (res.exists) {
         existsEl.className = "m115-exists exists";
-        existsEl.textContent = "⚠️ 番号" + code + "已存在";
+        existsEl.textContent = "⚠️ " + formatExistsText(code, res);
       } else {
         existsEl.className = "m115-exists missing";
         existsEl.textContent = "番号" + code + "未保存";
@@ -1167,7 +1202,7 @@
         const code = res.searchValue || "";
         fab.title = "点击仍可分析（" + title + "）";
         if (res.exists) {
-          fab.textContent = "番号" + code + "已存在";
+          fab.textContent = formatExistsText(code, res);
           fab.className = "m115-fab exists";
         } else {
           fab.textContent = "番号" + code + "未保存";
@@ -1232,7 +1267,7 @@
             const code = res.searchValue || "";
             fab.title = "点击仍可分析（" + title + "）";
             if (res.exists) {
-              fab.textContent = "番号" + code + "已存在";
+              fab.textContent = formatExistsText(code, res);
               fab.className = "m115-fab exists";
             } else {
               fab.textContent = "番号" + code + "未保存";

@@ -306,45 +306,78 @@ async function prepareImageBytes(filename, bytes) {
   }
 }
 
+/** 是否需要对图片请求注入 Referer/Cookie：仅 javbus 需要（javdb 不需要，用户规范） */
+function shouldInjectHeaders(referer) {
+  const host = hostOf(referer || "");
+  return /(^|\.)javbus\.com$/i.test(host);
+}
+
 /**
  * 后台兜底获取图片（内容脚本取不到字节时使用）：
- * 1) 合并图片域名与页面域名的 Cookie，与页面 Referer 一起通过 declarativeNetRequest
- *    修改请求头（并移除 Origin），再 fetch
- *    （按 origin 匹配，图片重定向后依然生效）
+ * 1) javbus：合并图片域名与页面域名的 Cookie，与页面 Referer 一起通过 declarativeNetRequest
+ *    修改请求头（并移除 Origin）再 fetch（按域名匹配，重定向后依然生效）；
+ *    javdb：不加 Referer、不注入任何头，直接 fetch（用户规范）
  * 2) 校验 Content-Type 确实是图片（避免把 HTML 错误页当图片）
  * 3) 交给 prepareImageBytes 编码字节（base64）供上传使用
+ * 4) 偶发网络失败（Failed to fetch）时自动重试：最多 3 次（延迟 1s/2s），
+ *    javbus 最后一次去掉注入改为直连兜底
  */
 async function prepareImageDownload(imageUrl, filename, referer) {
-  const cookieHeader = await getCookiesHeaderForFetch(imageUrl, referer);
-  // DNR 注入：设置 Referer（页面地址）+ Cookie，并移除 Origin（与 wget 行为一致）
-  const ruleId = await dnrInjectHeaders(imageUrl, referer, cookieHeader, true);
-  await appendLog(
-    "info",
-    "后台兜底获取图片：url=" + imageUrl +
-      "，注入Referer=" + (referer || "无") +
-      "，注入Cookie条数=" + (cookieHeader ? cookieHeader.split("; ").length : 0) +
-      "，DNR规则=" + (ruleId ? "已注册" : "未注册")
-  );
-  try {
-    // 有显式 Cookie 头时用 credentials: "omit"，避免浏览器重复附加一份
-    const resp = await fetch(imageUrl, {
-      credentials: cookieHeader ? "omit" : "include",
-    });
-    await appendLog(resp.ok ? "ok" : "error", "后台兜底图片响应：HTTP " + resp.status);
-    if (!resp.ok) return { ok: false, error: "图片获取失败（HTTP " + resp.status + "）" };
-    const ct = resp.headers.get("content-type") || "";
-    if (ct && !/^image\//i.test(ct)) {
-      return { ok: false, error: "目标地址返回的不是图片（" + ct + "）" };
+  const inject = shouldInjectHeaders(referer); // javbus 才注入；javdb 不注入
+  const cookieHeader = inject ? await getCookiesHeaderForFetch(imageUrl, referer) : "";
+  const MAX_ATTEMPTS = 3;
+  let ruleId = null;
+  let lastError = "";
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // javbus：前两次带注入，最后一次直连；javdb：始终直连（不加任何头）
+    const useInjection = inject && attempt < MAX_ATTEMPTS;
+    if (useInjection && !ruleId) {
+      ruleId = await dnrInjectHeaders(imageUrl, referer, cookieHeader, true);
     }
-    const blob = await resp.blob();
-    const bytes = new Uint8Array(await blob.arrayBuffer());
-    if (!bytes.length) return { ok: false, error: "图片内容为空" };
-    return await prepareImageBytes(filename, bytes);
-  } catch (e) {
-    return { ok: false, error: e && e.message ? e.message : String(e) };
-  } finally {
-    await dnrRemoveHeaders(ruleId);
+    if (!useInjection && ruleId) {
+      await dnrRemoveHeaders(ruleId);
+      ruleId = null;
+    }
+    await appendLog(
+      "info",
+      "后台兜底获取图片（第 " + attempt + "/" + MAX_ATTEMPTS + " 次，注入=" + (useInjection && ruleId ? "是" : "否") + "）：url=" +
+        imageUrl + "，Referer=" + (referer || "无") +
+        "，Cookie条数=" + (cookieHeader ? cookieHeader.split("; ").length : 0)
+    );
+    try {
+      // 有显式 Cookie 头且使用注入时用 credentials: "omit"，避免浏览器重复附加一份
+      const resp = await fetch(imageUrl, {
+        credentials: cookieHeader && useInjection ? "omit" : "include",
+      });
+      await appendLog(resp.ok ? "ok" : "error", "后台兜底图片响应（第 " + attempt + " 次）：HTTP " + resp.status);
+      if (!resp.ok) {
+        lastError = "图片获取失败（HTTP " + resp.status + "）";
+        if (attempt < MAX_ATTEMPTS) {
+          await sleep(1000 * attempt);
+          continue;
+        }
+        break;
+      }
+      const ct = resp.headers.get("content-type") || "";
+      if (ct && !/^image\//i.test(ct)) {
+        return { ok: false, error: "目标地址返回的不是图片（" + ct + "）" };
+      }
+      const blob = await resp.blob();
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      if (!bytes.length) return { ok: false, error: "图片内容为空" };
+      return await prepareImageBytes(filename, bytes);
+    } catch (e) {
+      lastError = e && e.message ? e.message : String(e);
+      await appendLog("error", "后台兜底图片请求异常（第 " + attempt + " 次）：" + lastError);
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(1000 * attempt);
+        continue;
+      }
+      break;
+    }
   }
+  if (ruleId) await dnrRemoveHeaders(ruleId);
+  return { ok: false, error: lastError || "图片获取失败" };
 }
 
 /**
@@ -829,15 +862,24 @@ async function searchExistingMovies(title) {
     const data = Array.isArray(json && json.data) ? json.data : [];
     const codeLower = code.toLowerCase();
     const matches = data.filter((it) => String(it.n || "").toLowerCase().startsWith(codeLower));
+    // 用户规范（115 data 字段）：
+    //  - fid 存在且非空 → 文件，dp 为其父目录名称
+    //  - fid 为空 → 目录，n 即目录自身名称
+    const matchesInfo = matches.slice(0, 10).map((m) => {
+      const isFile = m.fid != null && String(m.fid) !== "";
+      const dirName = isFile ? String(m.dp || "") : String(m.n || "");
+      return { n: m.n, fid: m.fid, dp: m.dp || "", dirName };
+    });
     await appendLog(
       "info",
-      "115查重：番号=" + code + "，搜索结果 " + data.length + " 条，匹配 " + matches.length + " 条"
+      "115查重：番号=" + code + "，搜索结果 " + data.length + " 条，匹配 " + matches.length + " 条" +
+        (matchesInfo.length && matchesInfo[0].dirName ? "，所在目录=" + matchesInfo[0].dirName : "")
     );
     return {
       ok: true,
       exists: matches.length > 0,
       searchValue: code,
-      matches: matches.slice(0, 10).map((m) => ({ n: m.n, fid: m.fid })),
+      matches: matchesInfo,
     };
   } catch (e) {
     return { ok: false, error: e && e.message ? e.message : String(e) };
