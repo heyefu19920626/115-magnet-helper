@@ -517,11 +517,12 @@
       color: #fff; background: linear-gradient(135deg, #1677ff, #0958d9);
       border: none; border-radius: 22px;
       box-shadow: 0 4px 16px rgba(9, 88, 217, .45);
-      cursor: pointer; user-select: none;
+      cursor: grab; user-select: none;
+      touch-action: none;
       transition: transform .15s ease, box-shadow .15s ease;
     }
     .m115-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 6px 20px rgba(9,88,217,.55); }
-    .m115-fab:active { transform: translateY(0) scale(.97); }
+    .m115-fab:active { transform: translateY(0) scale(.97); cursor: grabbing; }
     /* 查重状态：已存在（红） / 未保存（蓝） */
     .m115-fab.exists {
       background: linear-gradient(135deg, #ff4d4f, #cf1322);
@@ -1025,8 +1026,89 @@
     }
   }
 
+  /* ================= 按钮可拖动定位 ================= */
+
+  let fabDragSuppress = false; // 拖拽结束后抑制一次 click
+
+  /**
+   * 让「分析」按钮可拖动，并把新位置保存到 chrome.storage.local（跨页面生效）。
+   * 使用 Pointer Events（兼容鼠标与触摸），拖拽超过阈值视为拖动而非点击。
+   */
+  function makeFabDraggable(el) {
+    let dragging = false;
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
+    let origLeft = 0;
+    let origTop = 0;
+
+    el.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      moved = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      const rect = el.getBoundingClientRect();
+      origLeft = rect.left;
+      origTop = rect.top;
+      el.style.right = "auto"; // 拖动后改用 left/top 定位
+      el.style.left = origLeft + "px";
+      el.style.top = origTop + "px";
+      e.preventDefault();
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch (err) {
+        /* ignore */
+      }
+    });
+
+    el.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+      // 限制在视口内
+      const w = el.offsetWidth || 80;
+      const h = el.offsetHeight || 40;
+      const left = Math.max(0, Math.min(origLeft + dx, window.innerWidth - w));
+      const top = Math.max(0, Math.min(origTop + dy, window.innerHeight - h));
+      el.style.left = left + "px";
+      el.style.top = top + "px";
+    });
+
+    el.addEventListener("pointerup", () => {
+      if (!dragging) return;
+      dragging = false;
+      if (moved) {
+        const rect = el.getBoundingClientRect();
+        chrome.storage.local.set({
+          m115FabPos: { left: Math.round(rect.left), top: Math.round(rect.top) },
+        });
+        fabDragSuppress = true;
+      }
+    });
+  }
+
+  // 恢复上次保存的按钮位置
+  try {
+    chrome.storage.local.get("m115FabPos", (o) => {
+      const p = o && o.m115FabPos;
+      if (p && typeof p.left === "number" && typeof p.top === "number") {
+        fab.style.right = "auto";
+        fab.style.left = p.left + "px";
+        fab.style.top = p.top + "px";
+      }
+    });
+  } catch (e) {
+    /* ignore */
+  }
+  makeFabDraggable(fab);
+
   // 点击「分析」：获取标题 + 最大图片，分析磁力链接并弹框展示
   fab.addEventListener("click", async () => {
+    if (fabDragSuppress) {
+      fabDragSuppress = false; // 拖拽结束后的 click 不触发分析
+      return;
+    }
     const title = getContentTitle();
     const image = await findLargestImage();
     const imageUrl = image ? image.url : "";

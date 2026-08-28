@@ -67,7 +67,12 @@ async function dnrInjectHeaders(imageUrl, referer, cookieHeader, removeOrigin) {
           id,
           priority: 1,
           action: { type: "modifyHeaders", requestHeaders },
-          condition: { requestDomains: [host] },
+          condition: {
+            requestDomains: [host],
+            // 只匹配 fetch 请求（xmlhttprequest/other），
+            // 绝不影响页面 <img> 等图片加载——避免残留规则干扰 CDN 图片请求
+            resourceTypes: ["xmlhttprequest", "other"],
+          },
         },
       ],
     });
@@ -991,3 +996,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+/* ================= 启动清理 ================= */
+
+// SW 启动时清理遗留的 DNR 会话规则（id >= 11501 是本扩展创建的）：
+// 防止 SW 被回收等导致删除失败、规则残留，进而干扰对应域名上的页面图片等请求
+(async function cleanupStaleDnrRules() {
+  try {
+    const rules = await chrome.declarativeNetRequest.getSessionRules();
+    const stale = rules.filter((r) => Number(r.id) >= 11501).map((r) => r.id);
+    if (stale.length) {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: stale });
+      console.log("[115磁力助手] 已清理遗留 DNR 规则 " + stale.length + " 条");
+    }
+  } catch (e) {
+    /* ignore */
+  }
+})();
